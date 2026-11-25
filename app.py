@@ -1,3723 +1,1195 @@
-from __future__ import annotations
-
-
-
-import html
-
-import inspect
-
+import base64
 import io
-
-import re
-
-from dataclasses import dataclass, field
-
-from pathlib import Path
-
-from typing import Any, Callable, Iterable
-
-from uuid import uuid4
-
-
+import os
+import uuid
+from datetime import datetime
+from typing import Any, Dict, List
 
 import pandas as pd
-
 import streamlit as st
-
-from openpyxl.utils import get_column_letter
-
 from PIL import Image
 
-
-
 from database import (
-
-    ASSETS_DIR,
-
-    add_catalog_item,
-
-    adjust_inventory_stock,
-
-    delete_catalog_item,
-
+    DEFAULT_DB_PATH,
+    add_item,
+    adjust_item_stock,
+    clear_all_kits,
+    create_kit,
+    delete_item,
     delete_kit,
-
     delete_recipe,
-
-    format_address_summary,
-
-    get_catalog_items,
-
-    get_inventory_items,
-
-    get_inventory_movements,
-
-    get_kits_history,
-
-    get_recipes,
-
+    generate_code_from_name,
     init_db,
-
-    remove_from_inventory,
-
-    save_kit,
-
+    is_postgres_enabled,
+    list_items,
+    list_kits,
+    list_recipes,
+    list_stock_movements,
     save_recipe,
-
-    update_catalog_item,
-
-    update_recipe,
-
+    update_item,
+    update_kit,
 )
 
+ASSETS_DIR = "assets"
+os.makedirs(ASSETS_DIR, exist_ok=True)
 
 
-# =============================================================================
-
-# 1. CONFIGURAÇÃO E CONSTANTES
-
-# =============================================================================
-
-
-
-APP_TITLE = "Kits Momento Uau"
-
-APP_SUBTITLE = "Montagem visual, controle de inventário e cálculo automático"
-
-
-
-STATUS_OPTIONS = ["Em montagem", "Conferido", "Finalizado"]
-
-STATUS_CHIP = {"Em montagem": "chip-warn", "Conferido": "chip-blue", "Finalizado": "chip-ok"}
-
-MAX_BATCH_KITS = 10
-
-ALLOWED_IMAGE_TYPES = ["png", "jpg", "jpeg", "webp"]
-
-
-
-PAGES = {
-
-    "montagem": "Montagem do kit",
-
-    "inventario": "Inventário",
-
-    "catalogo": "Catálogo e brindes",
-
-    "historico": "Histórico",
-
-}
-
-
-
-FORM_FIELDS = [
-
-    "kit_code", "client_name", "status", "notes",
-
-    "cep", "street", "address_number", "complement", "neighborhood", "city_state",
-
-]
-
-ADDRESS_FIELDS = ["cep", "street", "address_number", "complement", "neighborhood", "city_state"]
-
-
-
-STRETCH: dict[str, Any] = (
-
-    {"width": "stretch"}
-
-    if "width" in inspect.signature(st.button).parameters
-
-    else {"use_container_width": True}
-
-)
-
-
-
-Item = dict[str, Any]
-
-
-
-
-
-@dataclass
-
-class KitTotals:
-
-    lines: list[dict[str, Any]] = field(default_factory=list)
-
-    quantity: int = 0
-
-    value: float = 0.0
-
-
-
-
-
-# =============================================================================
-
-# 2. UTILIDADES
-
-# =============================================================================
-
-
-
-
+# ==============================================================================
+# UTILITÁRIOS DE FORMATAÇÃO E IMAGEM
+# ==============================================================================
 
 def format_brl(value: float) -> str:
-
-    """1234.5 -> 'R$ 1.234,50'."""
-
-    formatted = f"{float(value):,.2f}"
-
-    formatted = formatted.replace(",", "X").replace(".", ",").replace("X", ".")
-
+    formatted = f"{float(value):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
     return f"R$ {formatted}"
 
 
-
-
-
-def esc(value: Any) -> str:
-
-    """Escapa texto do usuário antes de inseri-lo em HTML."""
-
-    return html.escape(str(value or ""))
-
-
-
-
-
-def chunked(seq: list[Any], size: int) -> Iterable[list[Any]]:
-
-    for start in range(0, len(seq), size):
-
-        yield seq[start : start + size]
-
-
-
-
-
-def icon_text(item: Item) -> str:
-
-    raw = str(item.get("icon") or "").strip().strip("[]").strip()
-
-    if not raw or raw.upper() == "ITEM":
-
-        raw = (str(item.get("name") or "").strip()[:1] or "?").upper()
-
-    return raw
-
-
-
-
-
-def icon_for_input(item: Item) -> str:
-
-    raw = str(item.get("icon") or "").strip()
-
-    return "" if raw.upper() == "[ITEM]" else raw
-
-
-
-
-
-def _safe_filename(original_name: str) -> str:
-
-    stem = Path(original_name).stem
-
-    ext = Path(original_name).suffix.lower()
-
-    if ext not in {f".{t}" for t in ALLOWED_IMAGE_TYPES}:
-
-        ext = ".png"
-
-    clean_stem = re.sub(r"[^a-zA-Z0-9_-]+", "_", stem).strip("_") or "brinde"
-
-    return f"{clean_stem}_{uuid4().hex[:8]}{ext}"
-
-
-
-
-
-def save_uploaded_image(uploaded_file: Any) -> str:
-
+def save_uploaded_image(uploaded_file) -> str:
     if uploaded_file is None:
+        return ""
+    os.makedirs(ASSETS_DIR, exist_ok=True)
+    ext = os.path.splitext(uploaded_file.name)[1].lower() or ".png"
+    filename = f"{uuid.uuid4().hex[:12]}{ext}"
+    dest_path = os.path.join(ASSETS_DIR, filename)
+    img = Image.open(uploaded_file)
+    img.thumbnail((360, 360))
+    img.save(dest_path)
+    return dest_path
 
+
+def get_image_base64(image_path: str) -> str:
+    if not image_path or not os.path.exists(image_path):
+        return ""
+    try:
+        with open(image_path, "rb") as f:
+            raw = f.read()
+        ext = os.path.splitext(image_path)[1].lower().replace(".", "") or "png"
+        if ext == "jpg":
+            ext = "jpeg"
+        b64 = base64.b64encode(raw).decode("utf-8")
+        return f"data:image/{ext};base64,{b64}"
+    except Exception:
         return ""
 
-    ASSETS_DIR.mkdir(parents=True, exist_ok=True)
 
-    target = ASSETS_DIR / _safe_filename(uploaded_file.name)
+def format_items_summary(kit_items: List[Dict[str, Any]]) -> str:
+    parts = [f"{int(i['quantity'])}x {i['item_name']}" for i in kit_items if int(i["quantity"]) > 0]
+    return ", ".join(parts)
 
-    raw_bytes = uploaded_file.getvalue()
 
-    try:
+# ==============================================================================
+# EXPORTAÇÃO PADRONIZADA (4 COLUNAS) E INVENTÁRIO
+# ==============================================================================
 
-        img = Image.open(io.BytesIO(raw_bytes))
-
-        img.thumbnail((600, 600))
-
-        img.save(target)
-
-    except Exception:
-
-        target.write_bytes(raw_bytes)
-
-    return str(target)
-
-
-
-
-
-def suggest_next_kit_code(history: list[Item], offset: int = 0) -> str:
-
-    max_num = 0
-
-    for row in history:
-
-        match = re.search(r"(\d+)", str(row.get("kit_code", "")))
-
-        if match:
-
-            max_num = max(max_num, int(match.group(1)))
-
-    return f"Kit {max_num + 1 + max(0, int(offset))}"
-
-
-
-
-
-def load_catalog_by_id() -> dict[int, Item]:
-
-    return {int(item["id"]): item for item in get_catalog_items()}
-
-
-
-
-
-def compute_totals(kit_items: dict[int, int], catalog_by_id: dict[int, Item]) -> KitTotals:
-
-    totals = KitTotals()
-
-    for item_id, qty in kit_items.items():
-
-        item = catalog_by_id.get(int(item_id))
-
-        if item is None or int(qty) <= 0:
-
-            continue
-
-        unit_price = float(item["unit_price"])
-
-        subtotal = round(unit_price * int(qty), 2)
-
-        totals.lines.append(
-
-            {
-
-                "item_id": int(item_id),
-
-                "item": item,
-
-                "quantity": int(qty),
-
-                "unit_price": unit_price,
-
-                "subtotal": subtotal,
-
-            }
-
-        )
-
-        totals.quantity += int(qty)
-
-        totals.value = round(totals.value + subtotal, 2)
-
-    return totals
-
-
-
-
-
-def single_kit_export_row(summary: dict[str, Any], money: Callable[[float], Any]) -> dict[str, Any]:
-
-    """Linha padronizada com as 4 colunas obrigatórias para colar ou baixar em Excel."""
-
-    return {
-
-        "Itens e quantidades": summary.get("items_summary", ""),
-
-        "Nome": summary.get("client_name", ""),
-
-        "Endereço": summary.get("address_summary", ""),
-
-        "Valor": money(float(summary.get("total_value", 0.0))),
-
-    }
-
-
-
-
-
-def build_batch_excel_bytes(summaries: list[dict[str, Any]]) -> bytes:
-
-    """Gera um arquivo .xlsx com uma linha por kit finalizado contendo as 4 colunas obrigatórias."""
-
-    rows = [single_kit_export_row(s, float) for s in summaries]
-
-    df = pd.DataFrame(rows)
-
-    output = io.BytesIO()
-
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-
-        df.to_excel(writer, index=False, sheet_name="Kits_Finalizados")
-
-        ws = writer.sheets["Kits_Finalizados"]
-
-        if not df.empty:
-
-            for r_idx in range(2, ws.max_row + 1):
-
-                ws.cell(row=r_idx, column=4).number_format = "R$ #,##0.00"
-
-            for idx, col in enumerate(df.columns, start=1):
-
-                longest = max(len(str(col)), *(len(str(v)) for v in df[col]))
-
-                ws.column_dimensions[get_column_letter(idx)].width = min(longest + 4, 65)
-
-    return output.getvalue()
-
-
-
-
-
-def build_batch_tsv(summaries: list[dict[str, Any]]) -> str:
-
-    """Linhas separadas por TAB: ao copiar e colar no Excel, preenche 4 colunas por linha."""
-
-    lines = []
-
-    for s in summaries:
-
-        row = single_kit_export_row(s, format_brl)
-
-        lines.append("\t".join(str(v) for v in row.values()))
-
-    return "\n".join(lines)
-
-
-
-
-
-def inventory_status_label(stock_qty: int, min_stock: int) -> tuple[str, str]:
-
-    if stock_qty <= 0:
-
-        return "Sem estoque", "chip-danger"
-
-    if stock_qty <= min_stock:
-
-        return "Estoque baixo", "chip-warn"
-
-    return "Disponível", "chip-ok"
-
-
-
-
-
-def inventory_rows(items: list[Item], money: Callable[[float], Any]) -> list[dict[str, Any]]:
-
+def build_kits_dataframe(kits: List[Dict[str, Any]]) -> pd.DataFrame:
     rows = []
-
-    for it in items:
-
-        qty = int(it.get("stock_qty", 0))
-
-        min_q = int(it.get("min_stock", 0))
-
-        unit = float(it.get("unit_price", 0.0))
-
-        status_text, _ = inventory_status_label(qty, min_q)
-
-        rows.append(
-
-            {
-
-                "Item": it["name"],
-
-                "Categoria": it.get("category") or "Geral",
-
-                "Quantidade em estoque": qty,
-
-                "Estoque mínimo": min_q,
-
-                "Situação": status_text,
-
-                "Valor unitário": money(unit),
-
-                "Valor total em estoque": money(round(qty * unit, 2)),
-
-            }
-
-        )
-
-    return rows
+    for k in kits:
+        rows.append({
+            "Itens e quantidades": format_items_summary(k.get("items", [])),
+            "Nome": k.get("recipient_name", ""),
+            "Endereço": k.get("recipient_address", ""),
+            "Valor": format_brl(float(k.get("total_value", 0.0))),
+        })
+    if not rows:
+        return pd.DataFrame(columns=["Itens e quantidades", "Nome", "Endereço", "Valor"])
+    return pd.DataFrame(rows)
 
 
-
-
-
-def build_inventory_excel_bytes(items: list[Item]) -> bytes:
-
-    df = pd.DataFrame(inventory_rows(items, float))
-
+def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Kits") -> bytes:
     output = io.BytesIO()
-
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-
-        df.to_excel(writer, index=False, sheet_name="Inventario_Brindes")
-
-        ws = writer.sheets["Inventario_Brindes"]
-
-        if not df.empty:
-
-            unit_col = list(df.columns).index("Valor unitário") + 1
-
-            tot_col = list(df.columns).index("Valor total em estoque") + 1
-
-            for r_idx in range(2, ws.max_row + 1):
-
-                ws.cell(row=r_idx, column=unit_col).number_format = "R$ #,##0.00"
-
-                ws.cell(row=r_idx, column=tot_col).number_format = "R$ #,##0.00"
-
-            for idx, col in enumerate(df.columns, start=1):
-
-                longest = max(len(str(col)), *(len(str(v)) for v in df[col]))
-
-                ws.column_dimensions[get_column_letter(idx)].width = min(longest + 3, 55)
-
+        df.to_excel(writer, index=False, sheet_name=sheet_name)
+        ws = writer.sheets[sheet_name]
+        for col_idx, col_name in enumerate(df.columns, start=1):
+            max_len = max(
+                len(str(col_name)),
+                *(len(str(val)) for val in df[col_name].fillna("")),
+            ) if not df.empty else len(str(col_name))
+            ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = min(max_len + 5, 65)
     return output.getvalue()
 
 
-
-
-
-def build_inventory_csv_bytes(items: list[Item]) -> bytes:
-
-    df = pd.DataFrame(inventory_rows(items, format_brl))
-
-    return df.to_csv(index=False, sep=";").encode("utf-8-sig")
-
-
-
-
-
-def _empty_recipient(kit_code: str = "", status: str = "") -> dict[str, str]:
-
-    return {
-
-        "kit_code": kit_code,
-
-        "client_name": "",
-
-        "status": status or STATUS_OPTIONS[0],
-
-        "notes": "",
-
-        "cep": "",
-
-        "street": "",
-
-        "address_number": "",
-
-        "complement": "",
-
-        "neighborhood": "",
-
-        "city_state": "",
-
-    }
-
-
-
-
-
-# =============================================================================
-
-# 3. ESTADO E AÇÕES (CALLBACKS)
-
-# =============================================================================
-
-
-
-
-
-def init_session_state() -> None:
-
-    ss = st.session_state
-
-    if "kit_items" in ss:
-
-        return
-
-    history = get_kits_history()
-
-    ss.kit_items = {}
-
-    ss.editing_kit_id = None
-
-    ss.form_nonce = 0
-
-    for name in FORM_FIELDS:
-
-        ss[f"form_{name}"] = ""
-
-    ss.form_kit_code = suggest_next_kit_code(history)
-
-    ss.form_status = STATUS_OPTIONS[0]
-
-
-
-    ss.batch_mode = False
-
-    ss.batch_nonce = 0
-
-    ss.batch_recipients = [
-
-        _empty_recipient(suggest_next_kit_code(history, 0), STATUS_OPTIONS[0]),
-
-        _empty_recipient(suggest_next_kit_code(history, 1), STATUS_OPTIONS[0]),
-
-    ]
-
-
-
-    ss.last_summary = None
-
-    ss.last_batch_summaries = []
-
-    ss.flash = None
-
-    ss.nav_page = "montagem"
-
-
-
-
-
-def set_form(**values: str) -> None:
-
-    ss = st.session_state
-
-    for name in FORM_FIELDS:
-
-        ss[f"form_{name}"] = str(values.get(name) or "")
-
-    if ss.form_status not in STATUS_OPTIONS:
-
-        ss.form_status = STATUS_OPTIONS[0]
-
-    ss.form_nonce = int(ss.form_nonce) + 1
-
-
-
-
-
-def current_form() -> dict[str, str]:
-
-    ss = st.session_state
-
-    nonce = ss.form_nonce
-
-    return {
-
-        name: str(ss.get(f"w_{name}_{nonce}", ss[f"form_{name}"]) or "")
-
-        for name in FORM_FIELDS
-
-    }
-
-
-
-
-
-def _sync_batch_from_widgets() -> list[dict[str, str]]:
-
-    ss = st.session_state
-
-    nonce = ss.batch_nonce
-
-    synced: list[dict[str, str]] = []
-
-    for idx, base in enumerate(ss.batch_recipients):
-
-        row = dict(base)
-
-        for name in FORM_FIELDS:
-
-            widget_key = f"wb_{idx}_{name}_{nonce}"
-
-            if widget_key in ss:
-
-                row[name] = str(ss[widget_key] or "")
-
-        if row.get("status") not in STATUS_OPTIONS:
-
-            row["status"] = STATUS_OPTIONS[0]
-
-        synced.append(row)
-
-    ss.batch_recipients = synced
-
-    return synced
-
-
-
-
-
-def add_batch_recipient() -> None:
-
-    ss = st.session_state
-
-    rows = _sync_batch_from_widgets()
-
-    if len(rows) >= MAX_BATCH_KITS:
-
-        notify("warning", f"Limite de {MAX_BATCH_KITS} destinatários por lote atingido.")
-
-        return
-
-    next_code = suggest_next_kit_code(get_kits_history(), offset=len(rows))
-
-    rows.append(_empty_recipient(next_code, STATUS_OPTIONS[0]))
-
-    ss.batch_recipients = rows
-
-    ss.batch_nonce = int(ss.batch_nonce) + 1
-
-
-
-
-
-def remove_batch_recipient(idx: int) -> None:
-
-    ss = st.session_state
-
-    rows = _sync_batch_from_widgets()
-
-    if len(rows) <= 1:
-
-        notify("warning", "Mantenha ao menos 1 destinatário no lote.")
-
-        return
-
-    rows.pop(idx)
-
-    ss.batch_recipients = rows
-
-    ss.batch_nonce = int(ss.batch_nonce) + 1
-
-
-
-
-
-def reset_batch_recipients() -> None:
-
-    ss = st.session_state
-
-    history = get_kits_history()
-
-    ss.batch_recipients = [
-
-        _empty_recipient(suggest_next_kit_code(history, 0), STATUS_OPTIONS[0]),
-
-        _empty_recipient(suggest_next_kit_code(history, 1), STATUS_OPTIONS[0]),
-
-    ]
-
-    ss.batch_nonce = int(ss.batch_nonce) + 1
-
-
-
-
-
-def toggle_batch_mode(enabled: bool) -> None:
-
-    ss = st.session_state
-
-    ss.batch_mode = bool(enabled)
-
-    if enabled:
-
-        ss.editing_kit_id = None
-
-        history = get_kits_history()
-
-        rows = _sync_batch_from_widgets()
-
-        for idx, r in enumerate(rows):
-
-            if not str(r.get("kit_code") or "").strip():
-
-                r["kit_code"] = suggest_next_kit_code(history, offset=idx)
-
-        ss.batch_recipients = rows
-
-        ss.batch_nonce = int(ss.batch_nonce) + 1
-
-
-
-
-
-def notify(kind: str, text: str) -> None:
-
-    st.session_state.flash = (kind, text)
-
-
-
-
-
-def show_flash() -> None:
-
-    flash = st.session_state.get("flash")
-
-    if flash:
-
-        st.toast(flash[1])
-
-        st.session_state.flash = None
-
-
-
-
-
-def go_to(page: str) -> None:
-
-    st.session_state.nav_page = page
-
-
-
-
-
-def add_item(item_id: int, qty: int = 1) -> None:
-
-    items = dict(st.session_state.kit_items)
-
-    items[item_id] = int(items.get(item_id, 0)) + qty
-
-    if items[item_id] <= 0:
-
-        items.pop(item_id)
-
-    st.session_state.kit_items = items
-
-    st.session_state.last_summary = None
-
-    st.session_state.last_batch_summaries = []
-
-
-
-
-
-def change_qty(item_id: int, delta: int) -> None:
-
-    items = dict(st.session_state.kit_items)
-
-    new_qty = int(items.get(item_id, 0)) + delta
-
-    if new_qty <= 0:
-
-        items.pop(item_id, None)
-
+def build_inventory_dataframe(items: List[Dict[str, Any]]) -> pd.DataFrame:
+    rows = []
+    for it in items:
+        qty = int(it.get("stock_qty", 0))
+        min_s = int(it.get("min_stock", 5))
+        unit = float(it.get("unit_price", 0.0))
+        status = "Esgotado" if qty == 0 else ("Estoque Baixo" if qty <= min_s else "Disponível")
+        rows.append({
+            "Código": it.get("code", ""),
+            "Brinde": it.get("name", ""),
+            "Estoque Atual": qty,
+            "Estoque Mínimo": min_s,
+            "Status": status,
+            "Valor Unitário": format_brl(unit),
+            "Valor Total em Estoque": format_brl(qty * unit),
+        })
+    if not rows:
+        return pd.DataFrame(
+            columns=["Código", "Brinde", "Estoque Atual", "Estoque Mínimo", "Status", "Valor Unitário", "Valor Total em Estoque"]
+        )
+    return pd.DataFrame(rows)
+
+
+# ==============================================================================
+# ESTILO VISUAL MODERNO COM ACENTOS EM AZUL (ADAPTATIVO CLARO / ESCURO)
+# ==============================================================================
+
+def inject_modern_blue_css() -> None:
+    st.markdown(
+        """
+        <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+        :root {
+            --brand-blue: #2563EB;
+            --brand-blue-hover: #1D4ED8;
+            --brand-blue-soft: rgba(37, 99, 235, 0.12);
+            --brand-blue-border: rgba(37, 99, 235, 0.35);
+            --card-border: rgba(148, 163, 184, 0.22);
+            --radius-xl: 20px;
+            --radius-lg: 14px;
+            --radius-pill: 999px;
+        }
+
+        html, body, [class*="css"] {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+        }
+
+        .block-container {
+            padding-top: 1.5rem !important;
+            padding-bottom: 3rem !important;
+            max-width: 1320px;
+        }
+
+        /* Cabeçalho Hero SaaS */
+        .uau-topbar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 1rem 1.4rem;
+            border-radius: var(--radius-xl);
+            background: var(--secondary-background-color);
+            border: 1px solid var(--card-border);
+            margin-bottom: 1.1rem;
+        }
+        .uau-brand-group {
+            display: flex;
+            align-items: center;
+            gap: 0.85rem;
+        }
+        .uau-logo-badge {
+            width: 42px;
+            height: 42px;
+            border-radius: 12px;
+            background: linear-gradient(135deg, #2563EB 0%, #3B82F6 100%);
+            color: #FFFFFF;
+            font-weight: 800;
+            font-size: 1rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 6px 16px rgba(37, 99, 235, 0.28);
+        }
+        .uau-title {
+            font-size: 1.25rem;
+            font-weight: 800;
+            margin: 0;
+            line-height: 1.2;
+            letter-spacing: -0.02em;
+        }
+        .uau-subtitle {
+            font-size: 0.82rem;
+            opacity: 0.72;
+            margin: 0.1rem 0 0 0;
+        }
+        .uau-status-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            padding: 0.35rem 0.85rem;
+            border-radius: var(--radius-pill);
+            font-size: 0.78rem;
+            font-weight: 600;
+            background: var(--brand-blue-soft);
+            color: #3B82F6;
+            border: 1px solid var(--brand-blue-border);
+        }
+
+        /* Navegação estilo Pill Bar */
+        div[data-testid="stRadio"] > div[role="radiogroup"] {
+            background: var(--secondary-background-color);
+            border: 1px solid var(--card-border);
+            border-radius: var(--radius-pill);
+            padding: 0.35rem;
+            display: inline-flex;
+            flex-wrap: wrap;
+            gap: 0.3rem;
+            margin-bottom: 0.75rem;
+        }
+        div[data-testid="stRadio"] > div[role="radiogroup"] > label {
+            border-radius: var(--radius-pill) !important;
+            padding: 0.42rem 1.05rem !important;
+            margin: 0 !important;
+            border: 1px solid transparent !important;
+            transition: all 0.18s ease;
+            cursor: pointer;
+        }
+        div[data-testid="stRadio"] > div[role="radiogroup"] > label > div:first-child {
+            display: none !important;
+        }
+        div[data-testid="stRadio"] > div[role="radiogroup"] > label[data-checked="true"],
+        div[data-testid="stRadio"] > div[role="radiogroup"] > label:has(input:checked) {
+            background: var(--brand-blue) !important;
+            color: #FFFFFF !important;
+            box-shadow: 0 4px 12px rgba(37, 99, 235, 0.30);
+        }
+        div[data-testid="stRadio"] > div[role="radiogroup"] > label:has(input:checked) p {
+            color: #FFFFFF !important;
+            font-weight: 600 !important;
+        }
+
+        /* Cartões de KPIs arredondados */
+        .kpi-card {
+            background: var(--secondary-background-color);
+            border: 1px solid var(--card-border);
+            border-radius: var(--radius-xl);
+            padding: 1.05rem 1.2rem;
+            transition: border-color 0.2s ease, transform 0.15s ease;
+        }
+        .kpi-card:hover {
+            border-color: var(--brand-blue-border);
+        }
+        .kpi-card-accent {
+            background: linear-gradient(135deg, rgba(37, 99, 235, 0.14) 0%, rgba(59, 130, 246, 0.05) 100%);
+            border: 1px solid var(--brand-blue-border);
+        }
+        .kpi-label {
+            font-size: 0.78rem;
+            font-weight: 600;
+            opacity: 0.72;
+            margin-bottom: 0.35rem;
+            text-transform: uppercase;
+            letter-spacing: 0.03em;
+        }
+        .kpi-value {
+            font-size: 1.55rem;
+            font-weight: 800;
+            letter-spacing: -0.02em;
+            line-height: 1.15;
+        }
+        .kpi-value-blue {
+            color: #3B82F6;
+        }
+        .kpi-foot {
+            font-size: 0.75rem;
+            opacity: 0.68;
+            margin-top: 0.3rem;
+        }
+
+        /* Cartões de seção estilo Checkout */
+        .section-card {
+            background: var(--secondary-background-color);
+            border: 1px solid var(--card-border);
+            border-radius: var(--radius-xl);
+            padding: 1.25rem 1.35rem;
+            margin-bottom: 1rem;
+        }
+        .section-card-title {
+            font-size: 1rem;
+            font-weight: 700;
+            margin: 0 0 0.2rem 0;
+            display: flex;
+            align-items: center;
+            gap: 0.45rem;
+        }
+        .section-card-desc {
+            font-size: 0.8rem;
+            opacity: 0.7;
+            margin: 0 0 0.85rem 0;
+        }
+
+        /* Card de Brinde na Grade */
+        .item-tile {
+            border: 1px solid var(--card-border);
+            border-radius: var(--radius-lg);
+            padding: 0.85rem;
+            background: var(--background-color);
+            margin-bottom: 0.45rem;
+            transition: all 0.18s ease;
+        }
+        .item-tile-active {
+            border: 1.5px solid var(--brand-blue) !important;
+            background: var(--brand-blue-soft) !important;
+        }
+        .item-code-pill {
+            display: inline-block;
+            padding: 0.18rem 0.55rem;
+            border-radius: 8px;
+            font-size: 0.72rem;
+            font-weight: 700;
+            background: var(--brand-blue-soft);
+            color: #3B82F6;
+            border: 1px solid var(--brand-blue-border);
+        }
+        .stock-badge-ok {
+            font-size: 0.72rem;
+            font-weight: 600;
+            color: #10B981;
+        }
+        .stock-badge-low {
+            font-size: 0.72rem;
+            font-weight: 600;
+            color: #F59E0B;
+        }
+        .stock-badge-out {
+            font-size: 0.72rem;
+            font-weight: 600;
+            color: #EF4444;
+        }
+
+        /* Order Summary lateral */
+        .summary-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0.48rem 0;
+            border-bottom: 1px dashed var(--card-border);
+            font-size: 0.88rem;
+        }
+        .summary-total-box {
+            margin-top: 0.85rem;
+            padding: 0.9rem 1rem;
+            border-radius: var(--radius-lg);
+            background: var(--brand-blue-soft);
+            border: 1px solid var(--brand-blue-border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        /* Botões primários em Azul */
+        div.stButton > button[kind="primary"],
+        div.stFormSubmitButton > button[kind="primary"] {
+            background-color: var(--brand-blue) !important;
+            border-color: var(--brand-blue) !important;
+            color: #FFFFFF !important;
+            border-radius: 12px !important;
+            font-weight: 600 !important;
+            transition: all 0.18s ease !important;
+        }
+        div.stButton > button[kind="primary"]:hover,
+        div.stFormSubmitButton > button[kind="primary"]:hover {
+            background-color: var(--brand-blue-hover) !important;
+            border-color: var(--brand-blue-hover) !important;
+            box-shadow: 0 6px 16px rgba(37, 99, 235, 0.32) !important;
+        }
+        div.stButton > button:not([kind="primary"]),
+        div.stDownloadButton > button {
+            border-radius: 12px !important;
+            font-weight: 500 !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# ==============================================================================
+# ESTADO DE SESSÃO E HELPERS DE MONTAGEM
+# ==============================================================================
+
+def ensure_session_state(items: List[Dict[str, Any]]) -> None:
+    if "kit_quantities" not in st.session_state:
+        st.session_state["kit_quantities"] = {int(i["id"]): 0 for i in items}
     else:
-
-        items[item_id] = new_qty
-
-    st.session_state.kit_items = items
-
-
-
-
-
-def remove_item(item_id: int) -> None:
-
-    items = dict(st.session_state.kit_items)
-
-    items.pop(item_id, None)
-
-    st.session_state.kit_items = items
-
-
-
-
-
-def apply_recipe(recipe_name: str, recipe_items: dict[int, int]) -> None:
-
-    catalog_by_id = load_catalog_by_id()
-
-    items = dict(st.session_state.kit_items)
-
-    for item_id, qty in recipe_items.items():
-
-        if int(item_id) in catalog_by_id and int(qty) > 0:
-
-            items[int(item_id)] = int(items.get(int(item_id), 0)) + int(qty)
-
-    st.session_state.kit_items = items
-
-    st.session_state.last_summary = None
-
-    st.session_state.last_batch_summaries = []
-
-    notify("info", f"Receita “{recipe_name}” aplicada ao kit.")
-
-
-
-
-
-def remove_recipe_direct(recipe_id: int) -> None:
-
-    ok, msg = delete_recipe(recipe_id)
-
-    notify("success" if ok else "warning", msg)
-
-
-
-
-
-def reset_kit() -> None:
-
-    st.session_state.kit_items = {}
-
-    st.session_state.editing_kit_id = None
-
-    set_form(kit_code=suggest_next_kit_code(get_kits_history()))
-
-    reset_batch_recipients()
-
-
-
-
-
-def cancel_edit() -> None:
-
-    reset_kit()
-
-    notify("info", "Edição cancelada. Nenhuma alteração foi salva.")
-
-
-
-
-
-def finalize_kit() -> None:
-
-    ss = st.session_state
-
-    form = current_form()
-
-    catalog_by_id = load_catalog_by_id()
-
-    totals = compute_totals(ss.kit_items, catalog_by_id)
-
-    editing_id = ss.editing_kit_id
-
-
-
-    ok, msg, saved_id = save_kit(
-
-        kit_code=form["kit_code"],
-
-        client_name=form["client_name"],
-
-        notes=form["notes"],
-
-        status=form["status"],
-
-        kit_items=ss.kit_items,
-
-        catalog_by_id=catalog_by_id,
-
-        cep=form["cep"],
-
-        street=form["street"],
-
-        address_number=form["address_number"],
-
-        complement=form["complement"],
-
-        neighborhood=form["neighborhood"],
-
-        city_state=form["city_state"],
-
-        kit_id=editing_id,
-
-    )
-
-    if not ok:
-
-        notify("warning", msg)
-
-        return
-
-
-
-    items_summary = ", ".join(
-
-        f"{line['quantity']}x {line['item']['name']}" for line in totals.lines
-
-    )
-
-    address_summary = format_address_summary(form)
-
-    kit_code_clean = form["kit_code"].strip() or "Kit"
-
-
-
-    ss.last_batch_summaries = []
-
-    ss.last_summary = {
-
-        "id": saved_id,
-
-        "kit_code": kit_code_clean,
-
-        "client_name": form["client_name"].strip(),
-
-        "address_summary": address_summary,
-
-        "items_summary": items_summary,
-
-        "total_quantity": totals.quantity,
-
-        "total_value": totals.value,
-
-        "edited": editing_id is not None,
-
-    }
-
-    reset_kit()
-
+        for i in items:
+            st.session_state["kit_quantities"].setdefault(int(i["id"]), 0)
+
+    st.session_state.setdefault("batch_count", 1)
+    st.session_state.setdefault("editing_kit_id", None)
+    st.session_state.setdefault("active_nav", "Montagem do Kit")
+
+
+def reset_builder_form(items: List[Dict[str, Any]]) -> None:
+    for i in items:
+        iid = int(i["id"])
+        st.session_state["kit_quantities"][iid] = 0
+        st.session_state[f"qty_input_{iid}"] = 0
+    for idx in range(10):
+        st.session_state[f"rec_name_{idx}"] = ""
+        st.session_state[f"rec_addr_{idx}"] = ""
+    st.session_state["kit_notes_input"] = ""
+    st.session_state["batch_count"] = 1
+    st.session_state["editing_kit_id"] = None
+
+
+def apply_recipe_to_builder(recipe: Dict[str, Any], items: List[Dict[str, Any]]) -> None:
+    for i in items:
+        iid = int(i["id"])
+        st.session_state["kit_quantities"][iid] = 0
+        st.session_state[f"qty_input_{iid}"] = 0
+    for r_item in recipe.get("items", []):
+        iid = int(r_item["item_id"])
+        qty = int(r_item["quantity"])
+        st.session_state["kit_quantities"][iid] = qty
+        st.session_state[f"qty_input_{iid}"] = qty
+
+
+def load_kit_for_editing(kit: Dict[str, Any], items: List[Dict[str, Any]]) -> None:
+    reset_builder_form(items)
+    st.session_state["editing_kit_id"] = int(kit["id"])
+    st.session_state["batch_count"] = 1
+    st.session_state["rec_name_0"] = kit.get("recipient_name", "")
+    st.session_state["rec_addr_0"] = kit.get("recipient_address", "")
+    st.session_state["kit_notes_input"] = kit.get("notes", "")
+
+    name_to_id = {i["name"].lower(): int(i["id"]) for i in items}
+    for ki in kit.get("items", []):
+        iid = ki.get("item_id")
+        if iid is None or int(iid) not in st.session_state["kit_quantities"]:
+            iid = name_to_id.get(ki["item_name"].lower())
+        if iid is not None:
+            qty = int(ki["quantity"])
+            st.session_state["kit_quantities"][int(iid)] = qty
+            st.session_state[f"qty_input_{int(iid)}"] = qty
+    st.session_state["active_nav"] = "Montagem do Kit"
+
+
+# ==============================================================================
+# ABA 1: MONTAGEM DO KIT (CHECKOUT 2 COLUNAS + LOTE + RECEITAS)
+# ==============================================================================
+
+def render_builder_tab(items: List[Dict[str, Any]], recipes: List[Dict[str, Any]]) -> None:
+    editing_id = st.session_state.get("editing_kit_id")
     if editing_id is not None:
+        c_edit_msg, c_edit_cancel = st.columns([4, 1])
+        with c_edit_msg:
+            st.info(f"Editando Kit #{editing_id} — ao salvar, o estoque será recalculado automaticamente.")
+        with c_edit_cancel:
+            if st.button("Cancelar edição", use_container_width=True):
+                reset_builder_form(items)
+                st.rerun()
 
-        go_to("historico")
+    col_left, col_right = st.columns([1.65, 1.0], gap="large")
 
-
-
-
-
-def finalize_batch_kits() -> None:
-
-    ss = st.session_state
-
-    rows = _sync_batch_from_widgets()
-
-    catalog_by_id = load_catalog_by_id()
-
-    totals = compute_totals(ss.kit_items, catalog_by_id)
-
-
-
-    if not totals.lines or totals.quantity <= 0:
-
-        notify("warning", "Adicione ao menos 1 item à caixa de brindes antes de gerar os kits.")
-
-        return
-
-
-
-    filled_rows = [r for r in rows if str(r.get("client_name") or "").strip()]
-
-    if not filled_rows:
-
-        notify("warning", "Informe o nome de pelo menos 1 destinatário para gerar os kits.")
-
-        return
-
-
-
-    count_kits = len(filled_rows)
-
-    for line in totals.lines:
-
-        cat_item = line["item"]
-
-        needed_total = int(line["quantity"]) * count_kits
-
-        avail = int(cat_item.get("stock_qty", 0))
-
-        if avail < needed_total:
-
-            notify(
-
-                "warning",
-
-                f"Estoque insuficiente de '{cat_item['name']}' para {count_kits} kits "
-
-                f"(disponível: {avail}, necessário: {needed_total}).",
-
-            )
-
-            return
-
-
-
-    items_summary = ", ".join(
-
-        f"{line['quantity']}x {line['item']['name']}" for line in totals.lines
-
-    )
-
-
-
-    saved_summaries: list[dict[str, Any]] = []
-
-    for idx, r in enumerate(filled_rows):
-
-        code_clean = str(r.get("kit_code") or "").strip() or suggest_next_kit_code(get_kits_history(), idx)
-
-        client_clean = str(r.get("client_name") or "").strip()
-
-        ok, msg, saved_id = save_kit(
-
-            kit_code=code_clean,
-
-            client_name=client_clean,
-
-            notes=str(r.get("notes") or ""),
-
-            status=str(r.get("status") or STATUS_OPTIONS[0]),
-
-            kit_items=ss.kit_items,
-
-            catalog_by_id=catalog_by_id,
-
-            cep=str(r.get("cep") or ""),
-
-            street=str(r.get("street") or ""),
-
-            address_number=str(r.get("address_number") or ""),
-
-            complement=str(r.get("complement") or ""),
-
-            neighborhood=str(r.get("neighborhood") or ""),
-
-            city_state=str(r.get("city_state") or ""),
-
-            kit_id=None,
-
+    # ---------------- COLUNA ESQUERDA: DESTINATÁRIOS + RECEITAS + BRINDES ----------------
+    with col_left:
+        st.markdown(
+            """
+            <div class="section-card">
+                <div class="section-card-title">1. Destinatário(s) e Entrega</div>
+                <div class="section-card-desc">Preencha um destinatário ou monte o mesmo kit para até 10 pessoas de uma só vez.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
 
-        if not ok:
+        if editing_id is None:
+            c_b1, c_b2, _ = st.columns([1.2, 1.2, 2.2])
+            with c_b1:
+                if st.button("+ Adicionar destinatário", use_container_width=True, disabled=st.session_state["batch_count"] >= 10):
+                    st.session_state["batch_count"] += 1
+                    st.rerun()
+            with c_b2:
+                if st.session_state["batch_count"] > 1:
+                    if st.button("- Remover último", use_container_width=True):
+                        idx = st.session_state["batch_count"] - 1
+                        st.session_state[f"rec_name_{idx}"] = ""
+                        st.session_state[f"rec_addr_{idx}"] = ""
+                        st.session_state["batch_count"] -= 1
+                        st.rerun()
 
-            notify("warning", f"{client_clean}: {msg}")
+        batch_total = 1 if editing_id is not None else int(st.session_state["batch_count"])
+        for idx in range(batch_total):
+            label_prefix = f"Destinatário #{idx + 1}" if batch_total > 1 else "Destinatário"
+            c_n, c_a = st.columns([1.05, 1.35])
+            with c_n:
+                st.text_input(
+                    f"Nome ({label_prefix})",
+                    key=f"rec_name_{idx}",
+                    placeholder="Ex.: Ana Paula Souza",
+                )
+            with c_a:
+                st.text_input(
+                    f"Endereço ({label_prefix})",
+                    key=f"rec_addr_{idx}",
+                    placeholder="Rua, número, complemento, cidade/UF e CEP",
+                )
 
-            return
-
-
-
-        saved_summaries.append(
-
-            {
-
-                "id": saved_id,
-
-                "kit_code": code_clean,
-
-                "client_name": client_clean,
-
-                "address_summary": format_address_summary(r),
-
-                "items_summary": items_summary,
-
-                "total_quantity": totals.quantity,
-
-                "total_value": totals.value,
-
-                "edited": False,
-
-            }
-
+        st.text_input(
+            "Observação interna (opcional)",
+            key="kit_notes_input",
+            placeholder="Ex.: Boas-vindas time comercial / Entrega urgente",
         )
 
-
-
-    ss.last_summary = None
-
-    ss.last_batch_summaries = saved_summaries
-
-    ss.kit_items = {}
-
-    ss.editing_kit_id = None
-
-    set_form(kit_code=suggest_next_kit_code(get_kits_history()))
-
-    reset_batch_recipients()
-
-    notify("success", f"{len(saved_summaries)} kits gerados e baixados do inventário.")
-
-
-
-
-
-def load_kit_for_edit(kit: Item) -> None:
-
-    ss = st.session_state
-
-    catalog_by_id = load_catalog_by_id()
-
-    loaded: dict[int, int] = {}
-
-    missing: list[str] = []
-
-    for it in kit["items"]:
-
-        item_id = int(it["item_id"])
-
-        if item_id in catalog_by_id:
-
-            loaded[item_id] = int(it["quantity"])
-
-        else:
-
-            missing.append(str(it["item_name"]))
-
-
-
-    ss.batch_mode = False
-
-    ss.kit_items = loaded
-
-    ss.editing_kit_id = int(kit["id"])
-
-    ss.last_summary = None
-
-    ss.last_batch_summaries = []
-
-    set_form(**{name: kit.get(name) for name in FORM_FIELDS})
-
-    go_to("montagem")
-
-
-
-    msg = f"Editando “{kit['kit_code']}”."
-
-    if missing:
-
-        msg += f" Itens indisponíveis: {', '.join(missing)}."
-
-    notify("info", msg)
-
-
-
-
-
-def duplicate_kit(kit: Item) -> None:
-
-    ss = st.session_state
-
-    catalog_by_id = load_catalog_by_id()
-
-    ss.batch_mode = False
-
-    ss.kit_items = {
-
-        int(it["item_id"]): int(it["quantity"])
-
-        for it in kit["items"]
-
-        if int(it["item_id"]) in catalog_by_id
-
-    }
-
-    ss.editing_kit_id = None
-
-    ss.last_summary = None
-
-    ss.last_batch_summaries = []
-
-    values = {name: kit.get(name) for name in FORM_FIELDS}
-
-    values["kit_code"] = suggest_next_kit_code(get_kits_history())
-
-    values["status"] = STATUS_OPTIONS[0]
-
-    set_form(**values)
-
-    go_to("montagem")
-
-    notify("info", f"“{kit['kit_code']}” duplicado. Ajuste os dados e finalize.")
-
-
-
-
-
-def delete_kit_direct(kit_id: int) -> None:
-
-    ok, msg = delete_kit(kit_id)
-
-    if ok and st.session_state.editing_kit_id == kit_id:
-
-        reset_kit()
-
-    notify("success" if ok else "warning", msg)
-
-
-
-
-
-def inv_quick_delta(item_id: int, delta: int, reason: str) -> None:
-
-    ok, msg = adjust_inventory_stock(item_id=item_id, delta=delta, reason=reason)
-
-    notify("success" if ok else "warning", msg)
-
-
-
-
-
-def inv_remove_direct(item_id: int) -> None:
-
-    ok, msg = remove_from_inventory(item_id=item_id, active_kit_items=st.session_state.kit_items)
-
-    notify("success" if ok else "warning", msg)
-
-
-
-
-
-# =============================================================================
-
-# 4. ESTILOS (DESIGN MODERNO AZUL ADAPTATIVO CLARO/ESCURO)
-
-# =============================================================================
-
-
-
-CSS = """
-
-<style>
-
-    :root {
-
-        --uau-blue: #2563eb;
-
-        --uau-blue-dark: #1d4ed8;
-
-        --uau-blue-light: #3b82f6;
-
-        --uau-blue-soft: rgba(37, 99, 235, 0.12);
-
-        --uau-blue-border: rgba(37, 99, 235, 0.32);
-
-        --uau-border: rgba(148, 163, 184, 0.24);
-
-    }
-
-
-
-    .block-container { padding-top: 1.4rem; padding-bottom: 3rem; max-width: 1360px; }
-
-
-
-    /* Cabeçalho estilo dashboard SaaS com toques em azul */
-
-    .top-bar {
-
-        display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 14px;
-
-        background: var(--secondary-background-color);
-
-        border: 1px solid var(--uau-border);
-
-        border-radius: 20px; padding: 16px 24px; margin-bottom: 14px;
-
-        box-shadow: 0 4px 18px rgba(15, 23, 42, 0.05);
-
-    }
-
-    .brand-wrap { display: flex; align-items: center; gap: 14px; }
-
-    .brand-badge {
-
-        width: 44px; height: 44px; border-radius: 14px;
-
-        background: linear-gradient(135deg, #2563eb 0%, #3b82f6 100%);
-
-        color: #ffffff; font-weight: 800; font-size: 0.92rem; letter-spacing: 0.04em;
-
-        display: flex; align-items: center; justify-content: center;
-
-        box-shadow: 0 6px 14px rgba(37, 99, 235, 0.28);
-
-    }
-
-    .hero-title { font-size: 1.38rem; font-weight: 800; line-height: 1.2; letter-spacing: -0.01em; }
-
-    .hero-sub { margin-top: 2px; font-size: 0.84rem; opacity: 0.72; }
-
-    .header-pills { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-
-    .hero-pill {
-
-        background: var(--uau-blue-soft); border: 1px solid var(--uau-blue-border);
-
-        color: var(--uau-blue-light); border-radius: 999px;
-
-        padding: 6px 14px; font-size: 0.8rem; font-weight: 700; white-space: nowrap;
-
-    }
-
-    .hero-pill-solid {
-
-        background: var(--uau-blue); color: #ffffff; border-radius: 999px;
-
-        padding: 6px 14px; font-size: 0.8rem; font-weight: 700; white-space: nowrap;
-
-    }
-
-
-
-    /* Barra de navegação em pílula flutuante (inspiração referência 1) */
-
-    div[role="radiogroup"] {
-
-        display: inline-flex !important; flex-wrap: wrap; gap: 6px;
-
-        background: var(--secondary-background-color);
-
-        border: 1px solid var(--uau-border);
-
-        border-radius: 999px; padding: 6px; margin-bottom: 8px;
-
-        box-shadow: 0 2px 10px rgba(15, 23, 42, 0.04);
-
-    }
-
-    div[role="radiogroup"] > label {
-
-        background: transparent; border: 1px solid transparent;
-
-        border-radius: 999px; padding: 6px 18px; cursor: pointer; margin: 0;
-
-        transition: all 0.16s ease;
-
-    }
-
-    div[role="radiogroup"] > label:hover {
-
-        background: var(--uau-blue-soft);
-
-    }
-
-    div[role="radiogroup"] > label:has(input:checked) {
-
-        background: linear-gradient(135deg, #2563eb 0%, #3b82f6 100%);
-
-        border-color: #2563eb;
-
-        box-shadow: 0 4px 12px rgba(37, 99, 235, 0.28);
-
-    }
-
-    div[role="radiogroup"] > label:has(input:checked) * { color: #ffffff !important; font-weight: 700; }
-
-
-
-    /* Faixa de KPIs arredondados no topo */
-
-    .kpi-grid {
-
-        display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px;
-
-        margin-bottom: 16px;
-
-    }
-
-    @media (max-width: 900px) {
-
-        .kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-
-    }
-
-    .kpi-card {
-
-        background: var(--secondary-background-color);
-
-        border: 1px solid var(--uau-border);
-
-        border-radius: 18px; padding: 14px 18px;
-
-        transition: border-color 0.15s ease;
-
-    }
-
-    .kpi-card:hover { border-color: var(--uau-blue-border); }
-
-    .kpi-card-accent {
-
-        background: linear-gradient(135deg, rgba(37, 99, 235, 0.14) 0%, rgba(59, 130, 246, 0.06) 100%);
-
-        border: 1px solid var(--uau-blue-border);
-
-    }
-
-    .kpi-label {
-
-        font-size: 0.75rem; font-weight: 700; text-transform: uppercase;
-
-        letter-spacing: 0.05em; opacity: 0.68;
-
-    }
-
-    .kpi-num { font-size: 1.48rem; font-weight: 800; line-height: 1.2; margin-top: 4px; }
-
-    .kpi-sub { font-size: 0.78rem; opacity: 0.68; margin-top: 2px; }
-
-
-
-    /* Cartão lateral Order Summary (inspiração referência 2 com azul moderno) */
-
-    .summary-header {
-
-        display: flex; justify-content: space-between; align-items: center;
-
-        padding-bottom: 10px; margin-bottom: 12px;
-
-        border-bottom: 1px solid var(--uau-border);
-
-    }
-
-    .summary-title { font-size: 1.05rem; font-weight: 800; }
-
-    .total-card {
-
-        background: linear-gradient(135deg, #1e3a8a 0%, #2563eb 100%);
-
-        color: #ffffff; border-radius: 16px; padding: 16px 20px; margin: 10px 0 12px;
-
-        box-shadow: 0 8px 20px rgba(37, 99, 235, 0.24);
-
-    }
-
-    .total-eyebrow {
-
-        font-size: 0.72rem; font-weight: 700; letter-spacing: 0.08em;
-
-        text-transform: uppercase; color: rgba(255, 255, 255, 0.78);
-
-    }
-
-    .total-value { font-size: 2.15rem; font-weight: 800; line-height: 1.15; margin: 4px 0 2px; color: #ffffff; }
-
-    .total-meta { font-size: 0.84rem; color: rgba(255, 255, 255, 0.85); }
-
-
-
-    /* Ícones, badges e chips */
-
-    .icon-tile {
-
-        width: var(--s, 54px); height: var(--s, 54px);
-
-        display: flex; align-items: center; justify-content: center;
-
-        font-size: var(--fs, 19px); font-weight: 800; color: #2563eb;
-
-        overflow: hidden; border-radius: 14px;
-
-        background: rgba(37, 99, 235, 0.12);
-
-        border: 1px solid rgba(37, 99, 235, 0.22);
-
-    }
-
-    .chip {
-
-        display: inline-block; font-size: 0.72rem; font-weight: 700;
-
-        padding: 2px 10px; border-radius: 999px;
-
-        background: rgba(37, 99, 235, 0.12); color: #3b82f6;
-
-    }
-
-    .chip-blue   { background: rgba(37, 99, 235, 0.15); color: #2563eb; }
-
-    .chip-warn   { background: rgba(245, 158, 11, 0.16); color: #d97706; }
-
-    .chip-ok     { background: rgba(16, 185, 129, 0.16); color: #059669; }
-
-    .chip-danger { background: rgba(239, 68, 68, 0.16); color: #dc2626; }
-
-
-
-    .qty-badge {
-
-        display: inline-block; background: #2563eb; color: #ffffff;
-
-        font-size: 0.76rem; font-weight: 700; padding: 2px 10px; border-radius: 999px;
-
-    }
-
-    .price { font-size: 1.02rem; font-weight: 800; color: #3b82f6; }
-
-    .kit-value { font-size: 1.45rem; font-weight: 800; text-align: right; line-height: 1.2; color: #3b82f6; }
-
-    .kit-meta { text-align: right; opacity: 0.65; font-size: 0.82rem; }
-
-    .box-title { font-weight: 800; font-size: 0.98rem; }
-
-    .tile-name { text-align: center; font-weight: 700; font-size: 0.88rem; margin-top: 4px; }
-
-    .tile-qty { text-align: center; margin: 4px 0 2px; }
-
-    .tile-sub { text-align: center; opacity: 0.72; font-size: 0.8rem; font-weight: 600; margin-bottom: 6px; }
-
-
-
-    /* Botões primários em azul moderno */
-
-    button[kind="primary"] {
-
-        background: linear-gradient(135deg, #2563eb 0%, #3b82f6 100%) !important;
-
-        border-color: #2563eb !important;
-
-        color: #ffffff !important;
-
-        border-radius: 12px !important;
-
-        font-weight: 700 !important;
-
-        box-shadow: 0 4px 12px rgba(37, 99, 235, 0.22);
-
-    }
-
-    button[kind="primary"]:hover {
-
-        background: linear-gradient(135deg, #1d4ed8 0%, #2563eb 100%) !important;
-
-        border-color: #1d4ed8 !important;
-
-    }
-
-    button[kind="secondary"] {
-
-        border-radius: 12px !important;
-
-    }
-
-</style>
-
-"""
-
-
-
-
-
-def render_styles() -> None:
-
-    st.markdown(CSS, unsafe_allow_html=True)
-
-
-
-
-
-# =============================================================================
-
-# 5. COMPONENTES DE INTERFACE
-
-# =============================================================================
-
-
-
-
-
-def render_item_visual(item: Item, size: int = 56) -> None:
-
-    img_path = item.get("image_path") or ""
-
-    if img_path and Path(img_path).exists():
-
-        st.image(img_path, width=size)
-
-        return
-
-    text = icon_text(item)
-
-    factor = 0.5 if len(text) <= 1 else 0.34 if len(text) <= 3 else 0.24
-
-    st.markdown(
-
-        f"<div class='icon-tile' style='--s:{size}px;--fs:{int(size * factor)}px'>{esc(text)}</div>",
-
-        unsafe_allow_html=True,
-
-    )
-
-
-
-
-
-def render_header(history_count: int, total_stock: int) -> None:
-
-    in_block = history_count % MAX_BATCH_KITS
-
-    st.markdown(
-
-        f"""
-
-        <div class="top-bar">
-
-            <div class="brand-wrap">
-
-                <div class="brand-badge">UAU</div>
-
-                <div>
-
-                    <div class="hero-title">{APP_TITLE}</div>
-
-                    <div class="hero-sub">{APP_SUBTITLE}</div>
-
+        # Receitas rápidas (Kits Padrão)
+        if recipes:
+            st.markdown(
+                """
+                <div class="section-card" style="margin-top:0.85rem;">
+                    <div class="section-card-title">2. Kits Padrão (Receitas Rápidas)</div>
+                    <div class="section-card-desc">Aplique uma combinação pronta em 1 clique e ajuste se necessário.</div>
                 </div>
-
-            </div>
-
-            <div class="header-pills">
-
-                <span class="hero-pill">Estoque total: {total_stock} un.</span>
-
-                <span class="hero-pill-solid">Bloco: {in_block}/{MAX_BATCH_KITS} kits</span>
-
-            </div>
-
-        </div>
-
-        """,
-
-        unsafe_allow_html=True,
-
-    )
-
-
-
-
-
-def render_nav(history_count: int, total_stock: int) -> str:
-
-    labels = dict(PAGES)
-
-    labels["inventario"] = f"{PAGES['inventario']} ({total_stock})"
-
-    labels["historico"] = f"{PAGES['historico']} ({history_count})"
-
-    return st.radio(
-
-        "Navegação",
-
-        options=list(labels),
-
-        format_func=labels.get,
-
-        key="nav_page",
-
-        horizontal=True,
-
-        label_visibility="collapsed",
-
-    )
-
-
-
-
-
-def render_top_kpis(
-
-    totals: KitTotals,
-
-    total_stock: int,
-
-    low_stock_count: int,
-
-    history: list[Item],
-
-) -> None:
-
-    accumulated_val = sum(float(k.get("total_value", 0.0)) for k in history)
-
-    alert_text = f"{low_stock_count} item(ns) em alerta" if low_stock_count else "Níveis normais"
-
-    st.markdown(
-
-        f"""
-
-        <div class="kpi-grid">
-
-            <div class="kpi-card kpi-card-accent">
-
-                <div class="kpi-label">Kit em montagem</div>
-
-                <div class="kpi-num">{format_brl(totals.value)}</div>
-
-                <div class="kpi-sub">{totals.quantity} item(ns) na caixa</div>
-
-            </div>
-
-            <div class="kpi-card">
-
-                <div class="kpi-label">Kits finalizados</div>
-
-                <div class="kpi-num">{len(history)}</div>
-
-                <div class="kpi-sub">Total acumulado: {format_brl(accumulated_val)}</div>
-
-            </div>
-
-            <div class="kpi-card">
-
-                <div class="kpi-label">Peças em estoque</div>
-
-                <div class="kpi-num">{total_stock} un.</div>
-
-                <div class="kpi-sub">{alert_text}</div>
-
-            </div>
-
-            <div class="kpi-card">
-
-                <div class="kpi-label">Média por kit</div>
-
-                <div class="kpi-num">{format_brl(accumulated_val / len(history)) if history else "R$ 0,00"}</div>
-
-                <div class="kpi-sub">Baseado no histórico</div>
-
-            </div>
-
-        </div>
-
-        """,
-
-        unsafe_allow_html=True,
-
-    )
-
-
-
-
-
-def render_last_summary() -> None:
-
-    batch = st.session_state.get("last_batch_summaries") or []
-
-    if batch:
-
-        with st.container(border=True):
-
-            total_lote = sum(float(s.get("total_value", 0.0)) for s in batch)
-
-            st.success(
-
-                f"**{len(batch)} kits gerados e baixados do inventário.** "
-
-                f"Valor total do lote: {format_brl(total_lote)}."
-
+                """,
+                unsafe_allow_html=True,
             )
+            rec_cols = st.columns(min(len(recipes), 3))
+            for r_idx, rec in enumerate(recipes):
+                with rec_cols[r_idx % 3]:
+                    rec_total = sum(float(x["unit_price"]) * int(x["quantity"]) for x in rec.get("items", []))
+                    if st.button(
+                        f"{rec['name']} ({format_brl(rec_total)})",
+                        key=f"apply_rec_{rec['id']}",
+                        use_container_width=True,
+                    ):
+                        apply_recipe_to_builder(rec, items)
+                        st.rerun()
 
-            st.caption(
+        # Grade visual de Brindes
+        st.markdown(
+            """
+            <div class="section-card" style="margin-top:0.85rem;">
+                <div class="section-card-title">3. Seleção de Brindes</div>
+                <div class="section-card-desc">Defina as quantidades por kit. O saldo disponível em estoque é exibido em cada item.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
-                "Copie as linhas abaixo (ícone de copiar no canto direito) e cole direto no Excel "
-
-                "(uma linha por pessoa com: Itens e quantidades | Nome | Endereço | Valor):"
-
-            )
-
-            st.code(build_batch_tsv(batch), language=None)
-
-
-
-            c_dl, _ = st.columns([1.4, 2.6])
-
-            c_dl.download_button(
-
-                "Baixar planilha do lote (.xlsx)",
-
-                data=build_batch_excel_bytes(batch),
-
-                file_name="lote_kits_momento_uau.xlsx",
-
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-
-                key="dl_batch_kits",
-
-                **STRETCH,
-
-            )
-
-        return
-
-
-
-    summary = st.session_state.last_summary
-
-    if not summary:
-
-        return
-
-
-
-    with st.container(border=True):
-
-        if summary.get("edited"):
-
-            st.success(f"**{summary['kit_code']} atualizado.** Novo valor: {format_brl(summary['total_value'])}.")
-
+        if not items:
+            st.warning("Nenhum brinde ativo no catálogo. Cadastre itens na aba 'Catálogo e Brindes'.")
         else:
+            grid_cols = st.columns(3)
+            for idx, item in enumerate(items):
+                iid = int(item["id"])
+                stock = int(item.get("stock_qty", 0))
+                min_s = int(item.get("min_stock", 5))
+                cur_qty = int(st.session_state["kit_quantities"].get(iid, 0))
+                active_cls = "item-tile item-tile-active" if cur_qty > 0 else "item-tile"
 
-            st.success(
+                if stock == 0:
+                    stock_html = '<span class="stock-badge-out">Sem estoque (0)</span>'
+                elif stock <= min_s:
+                    stock_html = f'<span class="stock-badge-low">Baixo: {stock} un.</span>'
+                else:
+                    stock_html = f'<span class="stock-badge-ok">Estoque: {stock} un.</span>'
 
-                f"**{summary['kit_code']} finalizado e baixado do inventário.** "
+                img_b64 = get_image_base64(item.get("image_path", ""))
+                thumb_html = (
+                    f'<img src="{img_b64}" style="width:42px;height:42px;object-fit:cover;border-radius:10px;border:1px solid rgba(148,163,184,0.25);" />'
+                    if img_b64
+                    else f'<div style="width:42px;height:42px;border-radius:10px;background:rgba(37,99,235,0.14);color:#3B82F6;font-weight:800;font-size:0.82rem;display:flex;align-items:center;justify-content:center;">{item["code"]}</div>'
+                )
 
-                f"Registre {format_brl(summary['total_value'])} no formulário."
+                with grid_cols[idx % 3]:
+                    st.markdown(
+                        f"""
+                        <div class="{active_cls}">
+                            <div style="display:flex;align-items:center;gap:0.6rem;margin-bottom:0.45rem;">
+                                {thumb_html}
+                                <div style="min-width:0;">
+                                    <div style="font-weight:700;font-size:0.9rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{item['name']}</div>
+                                    <div style="font-size:0.82rem;font-weight:600;color:#3B82F6;">{format_brl(item['unit_price'])}</div>
+                                </div>
+                            </div>
+                            <div style="display:flex;justify-content:space-between;align-items:center;">
+                                <span class="item-code-pill">[{item['code']}]</span>
+                                {stock_html}
+                            </div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                    new_qty = st.number_input(
+                        f"Qtd {item['name']}",
+                        min_value=0,
+                        max_value=999,
+                        value=cur_qty,
+                        step=1,
+                        key=f"qty_input_{iid}",
+                        label_visibility="collapsed",
+                    )
+                    if int(new_qty) != cur_qty:
+                        st.session_state["kit_quantities"][iid] = int(new_qty)
+                        st.rerun()
 
+    # ---------------- COLUNA DIREITA: ORDER SUMMARY (RESUMO DO KIT) ----------------
+    with col_right:
+        selected_list = []
+        unit_kit_total = 0.0
+        total_pieces_per_kit = 0
+
+        for item in items:
+            iid = int(item["id"])
+            qty = int(st.session_state["kit_quantities"].get(iid, 0))
+            if qty > 0:
+                sub = round(float(item["unit_price"]) * qty, 2)
+                unit_kit_total = round(unit_kit_total + sub, 2)
+                total_pieces_per_kit += qty
+                selected_list.append({
+                    "item_id": iid,
+                    "item_name": item["name"],
+                    "item_code": item["code"],
+                    "unit_price": float(item["unit_price"]),
+                    "stock_qty": int(item.get("stock_qty", 0)),
+                    "quantity": qty,
+                    "subtotal": sub,
+                })
+
+        recipients_filled = []
+        for idx in range(batch_total):
+            r_name = st.session_state.get(f"rec_name_{idx}", "").strip()
+            r_addr = st.session_state.get(f"rec_addr_{idx}", "").strip()
+            if r_name:
+                recipients_filled.append((r_name, r_addr))
+
+        multiplier = max(1, len(recipients_filled)) if editing_id is None else 1
+        grand_total = round(unit_kit_total * multiplier, 2)
+
+        st.markdown(
+            """
+            <div class="section-card">
+                <div class="section-card-title">Resumo do Kit</div>
+                <div class="section-card-desc">Conferência em tempo real para o formulário e baixa automática no inventário.</div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        if not selected_list:
+            st.markdown(
+                '<div style="padding:1.2rem 0;text-align:center;opacity:0.65;font-size:0.88rem;">Nenhum brinde selecionado ainda. Escolha as quantidades ao lado.</div>',
+                unsafe_allow_html=True,
             )
+        else:
+            rows_html = ""
+            for s in selected_list:
+                rows_html += (
+                    f'<div class="summary-row">'
+                    f'<span><strong>{s["quantity"]}x</strong> {s["item_name"]} <span style="opacity:0.65;">[{s["item_code"]}]</span></span>'
+                    f'<span style="font-weight:600;">{format_brl(s["subtotal"])}</span>'
+                    f'</div>'
+                )
+            st.markdown(rows_html, unsafe_allow_html=True)
 
-
-
-        st.caption(
-
-            "Copie a linha abaixo (ícone de copiar no canto direito) e cole direto no Excel "
-
-            "(preenche automaticamente: Itens e quantidades | Nome | Endereço | Valor):"
-
+        st.markdown(
+            f"""
+                <div style="margin-top:0.75rem;font-size:0.83rem;opacity:0.78;display:flex;justify-content:space-between;">
+                    <span>Peças por kit</span>
+                    <strong>{total_pieces_per_kit} un.</strong>
+                </div>
+                <div style="margin-top:0.3rem;font-size:0.83rem;opacity:0.78;display:flex;justify-content:space-between;">
+                    <span>Destinatários preenchidos</span>
+                    <strong>{len(recipients_filled)}</strong>
+                </div>
+                <div class="summary-total-box">
+                    <div>
+                        <div style="font-size:0.76rem;font-weight:600;opacity:0.78;">VALOR DO KIT (COPIAR P/ FORMULÁRIO)</div>
+                        <div style="font-size:1.35rem;font-weight:800;color:#3B82F6;">{format_brl(unit_kit_total)}</div>
+                    </div>
+                    <div style="text-align:right;">
+                        <div style="font-size:0.74rem;opacity:0.72;">Total do lote ({multiplier}x)</div>
+                        <div style="font-size:1rem;font-weight:700;">{format_brl(grand_total)}</div>
+                    </div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
 
-        st.code(build_batch_tsv([summary]), language=None)
+        # Texto pronto para copiar rápido
+        if selected_list:
+            st.caption("Texto resumido dos itens (pronto para copiar):")
+            st.code(format_items_summary(selected_list), language=None)
 
+        # Checagem de estoque suficiente
+        stock_warnings = []
+        for s in selected_list:
+            needed = s["quantity"] * multiplier
+            if needed > s["stock_qty"]:
+                stock_warnings.append(
+                    f"{s['item_name']}: precisa de {needed} un., mas há {s['stock_qty']} un. no inventário."
+                )
+        for w in stock_warnings:
+            st.warning(w)
 
+        c_act1, c_act2 = st.columns([2, 1])
+        with c_act1:
+            btn_label = (
+                f"Salvar alterações do Kit #{editing_id}"
+                if editing_id is not None
+                else (f"Finalizar {len(recipients_filled)} Kits" if len(recipients_filled) > 1 else "Finalizar Kit")
+            )
+            if st.button(btn_label, type="primary", use_container_width=True):
+                if not selected_list:
+                    st.error("Selecione pelo menos 1 brinde antes de finalizar.")
+                elif not recipients_filled:
+                    st.error("Informe o nome de pelo menos 1 destinatário.")
+                else:
+                    notes_val = st.session_state.get("kit_notes_input", "")
+                    if editing_id is not None:
+                        r_name, r_addr = recipients_filled[0]
+                        update_kit(int(editing_id), r_name, r_addr, notes_val, selected_list)
+                        reset_builder_form(items)
+                        st.success(f"Kit #{editing_id} atualizado e estoque recalculado!")
+                        st.rerun()
+                    else:
+                        created_ids = []
+                        for r_name, r_addr in recipients_filled:
+                            kid = create_kit(r_name, r_addr, notes_val, selected_list, deduct_stock=True)
+                            created_ids.append(kid)
+                        reset_builder_form(items)
+                        if len(created_ids) == 1:
+                            st.success(f"Kit #{created_ids[0]} finalizado e descontado do inventário!")
+                        else:
+                            st.success(f"{len(created_ids)} kits finalizados e descontados do inventário!")
+                        st.rerun()
 
-        c_dl, _ = st.columns([1.3, 2.7])
+        with c_act2:
+            if st.button("Limpar", use_container_width=True):
+                reset_builder_form(items)
+                st.rerun()
 
-        safe_code = re.sub(r"[^a-zA-Z0-9_-]+", "_", summary["kit_code"]).strip("_") or "kit"
-
-        c_dl.download_button(
-
-            "Baixar planilha deste kit (.xlsx)",
-
-            data=build_batch_excel_bytes([summary]),
-
-            file_name=f"{safe_code}_momento_uau.xlsx",
-
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-
-            key=f"dl_single_kit_{summary.get('id', 'novo')}",
-
-            **STRETCH,
-
-        )
-
-
-
-
-
-def render_recipes(recipes: list[Item], catalog: list[Item], catalog_by_id: dict[int, Item]) -> None:
-
-    with st.container(border=True):
-
-        st.markdown("#### Receitas predefinidas")
-
-        tab_use, tab_save, tab_edit = st.tabs(["Aplicar receita", "Salvar composição", "Editar / excluir"])
-
-
-
-        with tab_use:
-
-            if not recipes:
-
-                st.caption("Nenhuma receita cadastrada.")
-
-            for row in chunked(recipes, 3):
-
-                cols = st.columns(3, gap="small")
-
-                for col, rec in zip(cols, row):
-
-                    with col, st.container(border=True):
-
-                        st.markdown(f"**{esc(rec['name'])}**")
-
-                        parts = [
-
-                            f"{qty}× {catalog_by_id[iid]['name']}"
-
-                            for iid, qty in rec["items"].items()
-
-                            if iid in catalog_by_id
-
-                        ]
-
-                        st.caption(", ".join(parts) if parts else "Sem itens")
-
-                        st.button(
-
-                            "Aplicar",
-
-                            key=f"apply_recipe_{rec['id']}",
-
-                            on_click=apply_recipe,
-
-                            args=(rec["name"], rec["items"]),
-
-                            **STRETCH,
-
-                        )
-
-
-
-        with tab_save:
-
-            with st.form("save_recipe_form", clear_on_submit=True):
-
-                c1, c2 = st.columns([1.2, 1.3])
-
-                r_name = c1.text_input("Nome da receita", placeholder="Ex.: Kit D – VIP")
-
-                r_desc = c2.text_input("Observação", placeholder="Opcional")
-
-                if st.form_submit_button("Salvar como receita", **STRETCH):
-
-                    ok, msg = save_recipe(r_name, r_desc, st.session_state.kit_items)
-
-                    notify("success" if ok else "warning", msg)
-
+        # Salvar montagem atual como Kit Padrão (Receita)
+        with st.expander("Salvar esta seleção como Kit Padrão"):
+            new_rec_name = st.text_input("Nome do Kit Padrão", placeholder="Ex.: Kit Onboarding Executivo")
+            new_rec_desc = st.text_input("Descrição curta", placeholder="Ex.: Garrafa + Caderno + Caneca")
+            if st.button("Salvar Kit Padrão", use_container_width=True):
+                if not new_rec_name.strip():
+                    st.error("Digite um nome para o Kit Padrão.")
+                elif not selected_list:
+                    st.error("Selecione ao menos um brinde na grade.")
+                else:
+                    qty_map = {s["item_id"]: s["quantity"] for s in selected_list}
+                    save_recipe(new_rec_name, new_rec_desc, qty_map)
+                    st.success(f"Kit Padrão '{new_rec_name}' salvo!")
                     st.rerun()
 
 
-
-        with tab_edit:
-
-            if not recipes:
-
-                st.caption("Nenhuma receita cadastrada.")
-
-            for rec in recipes:
-
-                rid = int(rec["id"])
-
-                with st.expander(f"{rec['name']}"):
-
-                    with st.form(f"edit_recipe_form_{rid}"):
-
-                        ed_name = st.text_input("Nome", value=rec["name"], key=f"rec_name_{rid}")
-
-                        ed_desc = st.text_input("Descrição", value=rec.get("description") or "", key=f"rec_desc_{rid}")
-
-                        st.markdown("**Quantidades por brinde**")
-
-                        new_map: dict[int, int] = {}
-
-                        for item in catalog:
-
-                            iid = int(item["id"])
-
-                            q_val = st.number_input(
-
-                                f"{item['name']} ({format_brl(item['unit_price'])})",
-
-                                min_value=0,
-
-                                value=int(rec["items"].get(iid, 0)),
-
-                                step=1,
-
-                                key=f"rec_qty_{rid}_{iid}",
-
-                            )
-
-                            if q_val > 0:
-
-                                new_map[iid] = int(q_val)
-
-                        if st.form_submit_button("Salvar receita", **STRETCH):
-
-                            ok, msg = update_recipe(rid, ed_name, ed_desc, new_map)
-
-                            notify("success" if ok else "warning", msg)
-
-                            st.rerun()
-
-
-
-                    st.button(
-
-                        "Excluir receita",
-
-                        key=f"del_recipe_{rid}",
-
-                        on_click=remove_recipe_direct,
-
-                        args=(rid,),
-
-                        **STRETCH,
-
-                    )
-
-
-
-
-
-def render_catalog_cards(catalog: list[Item]) -> None:
-
-    with st.container(border=True):
-
-        st.markdown("#### Catálogo de brindes")
-
-
-
-        categories = ["Todas"] + sorted({str(it.get("category") or "Geral") for it in catalog})
-
-        f1, f2 = st.columns([1.4, 1.0])
-
-        search = f1.text_input("Buscar", placeholder="Ex.: garrafa, blusa…", key="catalog_search")
-
-        category = f2.selectbox("Categoria", categories, key="catalog_category_filter")
-
-
-
-        term = search.strip().lower()
-
-        filtered = [
-
-            it
-
-            for it in catalog
-
-            if (category == "Todas" or (it.get("category") or "Geral") == category)
-
-            and (not term or term in it["name"].lower())
-
-        ]
-
-        if not filtered:
-
-            st.info("Nenhum brinde encontrado para o filtro atual.")
-
-            return
-
-
-
-        for row in chunked(filtered, 2):
-
-            cols = st.columns(2, gap="medium")
-
-            for col, item in zip(cols, row):
-
-                item_id = int(item["id"])
-
-                in_kit = int(st.session_state.kit_items.get(item_id, 0))
-
-                stock_qty = int(item.get("stock_qty", 0))
-
-                min_stock = int(item.get("min_stock", 0))
-
-                _, stock_chip = inventory_status_label(stock_qty, min_stock)
-
-
-
-                with col, st.container(border=True):
-
-                    c_vis, c_info = st.columns([0.9, 2.1])
-
-                    with c_vis:
-
-                        render_item_visual(item, size=58)
-
-                    with c_info:
-
-                        st.markdown(
-
-                            f"<span class='chip chip-blue'>{esc(item.get('category') or 'Geral')}</span> "
-
-                            f"<span class='chip {stock_chip}'>Estoque: {stock_qty}</span>",
-
-                            unsafe_allow_html=True,
-
-                        )
-
-                        st.markdown(f"**{esc(item['name'])}**")
-
-                        st.markdown(
-
-                            f"<span class='price'>{format_brl(item['unit_price'])}</span>",
-
-                            unsafe_allow_html=True,
-
-                        )
-
-                    st.button(
-
-                        f"Selecionado ({in_kit} no kit)" if in_kit else "Adicionar ao kit",
-
-                        key=f"add_catalog_item_{item_id}",
-
-                        type="primary" if in_kit else "secondary",
-
-                        on_click=add_item,
-
-                        args=(item_id,),
-
-                        **STRETCH,
-
-                    )
-
-
-
-
-
-def render_edit_banner() -> None:
-
-    editing_id = st.session_state.editing_kit_id
-
-    if editing_id is None:
-
-        return
-
-    with st.container(border=True):
-
-        c1, c2 = st.columns([2.2, 1.0])
-
-        c1.markdown(
-
-            f"**Editando o registro #{editing_id}** — "
-
-            "as alterações só valem depois de clicar em *Salvar alterações*."
-
-        )
-
-        c2.button("Cancelar edição", key="btn_cancel_edit", on_click=cancel_edit, **STRETCH)
-
-
-
-
-
-def render_total_card(totals: KitTotals, recipients_count: int = 1) -> None:
-
-    plural = "item" if totals.quantity == 1 else "itens"
-
-    if recipients_count > 1:
-
-        lote_total = round(totals.value * recipients_count, 2)
-
-        st.markdown(
-
-            f"""
-
-            <div class="total-card">
-
-                <div class="total-eyebrow">Valor por kit · Lote de {recipients_count} pessoas</div>
-
-                <div class="total-value">{format_brl(totals.value)}</div>
-
-                <div class="total-meta">{totals.quantity} {plural} por kit · Total do lote: {format_brl(lote_total)}</div>
-
-            </div>
-
-            """,
-
-            unsafe_allow_html=True,
-
-        )
-
-        return
-
-
-
+# ==============================================================================
+# ABA 2: INVENTÁRIO COMPLETO (CONTROLE DE ESTOQUE, REPOSIÇÃO E EXPORTAÇÃO)
+# ==============================================================================
+
+def render_inventory_tab(items: List[Dict[str, Any]]) -> None:
     st.markdown(
-
-        f"""
-
-        <div class="total-card">
-
-            <div class="total-eyebrow">Valor para preencher no formulário</div>
-
-            <div class="total-value">{format_brl(totals.value)}</div>
-
-            <div class="total-meta">{totals.quantity} {plural} no kit</div>
-
+        """
+        <div class="section-card">
+            <div class="section-card-title">Controle de Inventário e Estoque</div>
+            <div class="section-card-desc">Adicione novos brindes, faça reposição rápida ou ajuste quantidades. Cada kit finalizado dá baixa automática aqui.</div>
         </div>
-
         """,
-
         unsafe_allow_html=True,
-
     )
 
-
-
-
-
-def render_gift_box(totals: KitTotals, multiplier: int = 1) -> None:
-
-    with st.container(border=True):
-
-        st.markdown(
-
-            "<div class='summary-header'>"
-
-            "<span class='summary-title'>Resumo do kit</span>"
-
-            f"<span class='chip chip-blue'>{totals.quantity} un.</span>"
-
-            "</div>",
-
-            unsafe_allow_html=True,
-
+    # Exportação da planilha de inventário
+    inv_df = build_inventory_dataframe(items)
+    c_exp1, c_exp2, _ = st.columns([1.1, 1.1, 2.5])
+    with c_exp1:
+        st.download_button(
+            "Baixar Inventário (.xlsx)",
+            data=dataframe_to_excel_bytes(inv_df, sheet_name="Inventario"),
+            file_name=f"inventario_momento_uau_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+    with c_exp2:
+        st.download_button(
+            "Baixar Inventário (.csv)",
+            data=inv_df.to_csv(index=False, sep=";").encode("utf-8-sig"),
+            file_name=f"inventario_momento_uau_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+            mime="text/csv",
+            use_container_width=True,
         )
 
-        if not totals.lines:
-
-            st.caption("Nenhum item selecionado. Clique em um brinde ao lado ou aplique uma receita.")
-
-            return
-
-
-
-        low_warnings = []
-
-        for line in totals.lines:
-
-            avail = int(line["item"].get("stock_qty", 0))
-
-            needed = int(line["quantity"]) * max(1, multiplier)
-
-            if avail < needed:
-
-                low_warnings.append(f"{line['item']['name']} (disponível: {avail}, necessário: {needed})")
-
-        if low_warnings:
-
-            st.warning("Estoque insuficiente para finalizar: " + ", ".join(low_warnings))
-
-
-
-        for row in chunked(totals.lines, 3):
-
-            cols = st.columns(3, gap="small")
-
-            for col, line in zip(cols, row):
-
-                item_id = line["item_id"]
-
-                with col, st.container(border=True):
-
-                    render_item_visual(line["item"], size=46)
-
-                    st.markdown(
-
-                        f"<div class='tile-name'>{esc(line['item']['name'])}</div>"
-
-                        f"<div class='tile-qty'><span class='qty-badge'>× {line['quantity']}</span></div>"
-
-                        f"<div class='tile-sub'>{format_brl(line['subtotal'])}</div>",
-
-                        unsafe_allow_html=True,
-
-                    )
-
-                    b1, b2 = st.columns(2)
-
-                    b1.button("−", key=f"box_dec_{item_id}", on_click=change_qty, args=(item_id, -1), **STRETCH)
-
-                    b2.button("+", key=f"box_inc_{item_id}", on_click=change_qty, args=(item_id, 1), **STRETCH)
-
-                    st.button(
-
-                        "Retirar",
-
-                        key=f"box_remove_{item_id}",
-
-                        on_click=remove_item,
-
-                        args=(item_id,),
-
-                        **STRETCH,
-
-                    )
-
-
-
-
-
-def render_kit_form() -> None:
-
-    ss = st.session_state
-
-    nonce = ss.form_nonce
-
-
-
-    def text(name: str, label: str, placeholder: str = "") -> str:
-
-        return st.text_input(
-
-            label, value=ss[f"form_{name}"], key=f"w_{name}_{nonce}", placeholder=placeholder
-
-        )
-
-
-
-    with st.container(border=True):
-
-        st.markdown("**Dados do destinatário**")
-
-        c1, c2 = st.columns(2)
-
-        with c1:
-
-            ss.form_kit_code = text("kit_code", "Número ou nome do kit", "Ex.: Kit 1")
-
-        with c2:
-
-            ss.form_client_name = text("client_name", "Nome do cliente *", "Ex.: Cliente Novo")
-
-
-
-        c3, c4 = st.columns([1.0, 1.4])
-
-        with c3:
-
-            status_idx = STATUS_OPTIONS.index(ss.form_status) if ss.form_status in STATUS_OPTIONS else 0
-
-            ss.form_status = st.selectbox(
-
-                "Status", STATUS_OPTIONS, index=status_idx, key=f"w_status_{nonce}"
-
-            )
-
-        with c4:
-
-            ss.form_notes = text("notes", "Observações (opcional)", "Ex.: Entregar na recepção")
-
-
-
-        has_address = any(ss[f"form_{name}"] for name in ADDRESS_FIELDS)
-
-        with st.expander("Endereço de entrega (opcional)", expanded=has_address):
-
-            a1, a2, a3 = st.columns([1.0, 2.0, 0.8])
-
-            with a1:
-
-                ss.form_cep = text("cep", "CEP", "00000-000")
-
-            with a2:
-
-                ss.form_street = text("street", "Rua / Logradouro", "Ex.: Av. Paulista")
-
-            with a3:
-
-                ss.form_address_number = text("address_number", "Número", "1000")
-
-            a4, a5, a6 = st.columns([1.0, 1.2, 1.4])
-
-            with a4:
-
-                ss.form_complement = text("complement", "Complemento", "Sala / Andar")
-
-            with a5:
-
-                ss.form_neighborhood = text("neighborhood", "Bairro", "Ex.: Bela Vista")
-
-            with a6:
-
-                ss.form_city_state = text("city_state", "Cidade / UF", "Ex.: São Paulo - SP")
-
-
-
-
-
-def render_batch_form() -> int:
-
-    ss = st.session_state
-
-    nonce = ss.batch_nonce
-
-    rows = ss.batch_recipients
-
-    active_count = 0
-
-
-
-    for idx, row in enumerate(rows):
-
-        with st.container(border=True):
-
-            h1, h2 = st.columns([3.0, 1.0])
-
-            h1.markdown(f"**Destinatário {idx + 1}**")
-
-            if len(rows) > 1:
-
-                h2.button(
-
-                    "Remover",
-
-                    key=f"btn_rm_batch_{idx}_{nonce}",
-
-                    on_click=remove_batch_recipient,
-
-                    args=(idx,),
-
-                    **STRETCH,
-
-                )
-
-
-
-            c1, c2, c3 = st.columns([1.0, 1.6, 1.0])
-
-            code_val = c1.text_input(
-
-                "Kit",
-
-                value=row.get("kit_code", ""),
-
-                key=f"wb_{idx}_kit_code_{nonce}",
-
-                placeholder=f"Kit {idx + 1}",
-
-            )
-
-            name_val = c2.text_input(
-
-                "Nome *",
-
-                value=row.get("client_name", ""),
-
-                key=f"wb_{idx}_client_name_{nonce}",
-
-                placeholder="Nome da pessoa",
-
-            )
-
-            st_curr = row.get("status") if row.get("status") in STATUS_OPTIONS else STATUS_OPTIONS[0]
-
-            status_val = c3.selectbox(
-
-                "Status",
-
-                STATUS_OPTIONS,
-
-                index=STATUS_OPTIONS.index(st_curr),
-
-                key=f"wb_{idx}_status_{nonce}",
-
-            )
-
-
-
-            notes_val = st.text_input(
-
-                "Observações (opcional)",
-
-                value=row.get("notes", ""),
-
-                key=f"wb_{idx}_notes_{nonce}",
-
-                placeholder="Ex.: Entregar na recepção",
-
-            )
-
-
-
-            has_addr = any(row.get(f) for f in ADDRESS_FIELDS)
-
-            with st.expander("Endereço de entrega (opcional)", expanded=has_addr):
-
-                a1, a2, a3 = st.columns([1.0, 2.0, 0.8])
-
-                cep_val = a1.text_input("CEP", value=row.get("cep", ""), key=f"wb_{idx}_cep_{nonce}", placeholder="00000-000")
-
-                street_val = a2.text_input("Rua / Logradouro", value=row.get("street", ""), key=f"wb_{idx}_street_{nonce}", placeholder="Ex.: Av. Paulista")
-
-                num_val = a3.text_input("Número", value=row.get("address_number", ""), key=f"wb_{idx}_address_number_{nonce}", placeholder="1000")
-
-
-
-                a4, a5, a6 = st.columns([1.0, 1.2, 1.4])
-
-                comp_val = a4.text_input("Complemento", value=row.get("complement", ""), key=f"wb_{idx}_complement_{nonce}", placeholder="Sala / Andar")
-
-                neigh_val = a5.text_input("Bairro", value=row.get("neighborhood", ""), key=f"wb_{idx}_neighborhood_{nonce}", placeholder="Ex.: Bela Vista")
-
-                city_val = a6.text_input("Cidade / UF", value=row.get("city_state", ""), key=f"wb_{idx}_city_state_{nonce}", placeholder="Ex.: São Paulo - SP")
-
-
-
-            rows[idx] = {
-
-                "kit_code": code_val,
-
-                "client_name": name_val,
-
-                "status": status_val,
-
-                "notes": notes_val,
-
-                "cep": cep_val,
-
-                "street": street_val,
-
-                "address_number": num_val,
-
-                "complement": comp_val,
-
-                "neighborhood": neigh_val,
-
-                "city_state": city_val,
-
-            }
-
-            if name_val.strip():
-
-                active_count += 1
-
-
-
-    st.button(
-
-        "+ Adicionar pessoa ao lote",
-
-        key=f"btn_add_batch_{nonce}",
-
-        disabled=len(rows) >= MAX_BATCH_KITS,
-
-        on_click=add_batch_recipient,
-
-        **STRETCH,
-
-    )
-
-    return max(1, active_count)
-
-
-
-
-
-def render_kit_panel(catalog_by_id: dict[int, Item]) -> None:
-
-    ss = st.session_state
-
-    totals = compute_totals(ss.kit_items, catalog_by_id)
-
-    editing = ss.editing_kit_id is not None
-
-
-
-    if not editing:
-
-        m1, m2 = st.columns(2)
-
-        m1.button(
-
-            "1 pessoa",
-
-            key="mode_single",
-
-            type="primary" if not ss.batch_mode else "secondary",
-
-            on_click=toggle_batch_mode,
-
-            args=(False,),
-
-            **STRETCH,
-
-        )
-
-        m2.button(
-
-            "Várias pessoas (lote)",
-
-            key="mode_batch",
-
-            type="primary" if ss.batch_mode else "secondary",
-
-            on_click=toggle_batch_mode,
-
-            args=(True,),
-
-            **STRETCH,
-
-        )
-
-
-
-    render_edit_banner()
-
-
-
-    if ss.batch_mode and not editing:
-
-        render_gift_box(totals, multiplier=max(1, len([r for r in ss.batch_recipients if r.get("client_name", "").strip()])))
-
-        active_people = render_batch_form()
-
-        render_total_card(totals, recipients_count=active_people)
-
-        a1, a2 = st.columns([1.6, 1.0])
-
-        a1.button(
-
-            "Gerar kits do lote",
-
-            key="btn_finalize_batch",
-
-            type="primary",
-
-            disabled=not totals.lines,
-
-            on_click=finalize_batch_kits,
-
-            **STRETCH,
-
-        )
-
-        a2.button("Limpar", key="btn_clear_batch", on_click=reset_kit, **STRETCH)
-
-        return
-
-
-
-    render_gift_box(totals, multiplier=1)
-
-    render_kit_form()
-
-    render_total_card(totals, recipients_count=1)
-
-
-
-    a1, a2 = st.columns([1.6, 1.0])
-
-    a1.button(
-
-        "Salvar alterações" if editing else "Finalizar kit",
-
-        key="btn_finalize_kit",
-
-        type="primary",
-
-        disabled=not totals.lines,
-
-        on_click=finalize_kit,
-
-        **STRETCH,
-
-    )
-
-    a2.button("Limpar", key="btn_clear_kit", on_click=reset_kit, **STRETCH)
-
-
-
-
-
-# ---- Inventário -------------------------------------------------------------
-
-
-
-
-
-def page_inventory(inv_items: list[Item], all_catalog: list[Item]) -> None:
-
-    st.markdown("#### Controle de inventário")
-
-    st.caption(
-
-        "A cada kit finalizado (individual ou em lote), o estoque é reduzido automaticamente. "
-
-        "Se um kit for editado ou excluído no histórico, o saldo é recalculado."
-
-    )
-
-
-
-    total_units = sum(int(it.get("stock_qty", 0)) for it in inv_items)
-
-    total_stock_value = sum(
-
-        int(it.get("stock_qty", 0)) * float(it.get("unit_price", 0.0)) for it in inv_items
-
-    )
-
-    low_count = sum(
-
-        1 for it in inv_items if int(it.get("stock_qty", 0)) <= int(it.get("min_stock", 0))
-
-    )
-
-
-
-    m1, m2, m3 = st.columns(3)
-
-    m1.metric("Brindes no inventário", len(inv_items))
-
-    m2.metric("Unidades disponíveis", total_units)
-
-    m3.metric(
-
-        "Valor total em estoque",
-
-        format_brl(total_stock_value),
-
-        delta=f"{low_count} em alerta" if low_count else None,
-
-        delta_color="inverse" if low_count else "off",
-
-    )
-
-
-
-    st.write("")
-
-    exp1, exp2, _ = st.columns([1.1, 1.1, 2.2])
-
-    exp1.download_button(
-
-        "Exportar inventário Excel (.xlsx)",
-
-        data=build_inventory_excel_bytes(inv_items),
-
-        file_name="inventario_brindes_momento_uau.xlsx",
-
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-
-        **STRETCH,
-
-    )
-
-    exp2.download_button(
-
-        "Exportar inventário CSV (.csv)",
-
-        data=build_inventory_csv_bytes(inv_items),
-
-        file_name="inventario_brindes_momento_uau.csv",
-
-        mime="text/csv",
-
-        **STRETCH,
-
-    )
-
-
-
-    with st.expander("Adicionar novo item ao inventário", expanded=False):
-
-        with st.form("inv_add_item_form", clear_on_submit=True):
-
-            c1, c2, c3, c4, c5 = st.columns([2.0, 1.1, 1.0, 1.0, 1.3])
-
-            n_name = c1.text_input("Nome do item *", placeholder="Ex.: Squeeze")
-
-            n_price = c2.number_input("Valor unit. (R$) *", min_value=0.0, value=25.0, step=1.0, format="%.2f")
-
-            n_qty = c3.number_input("Qtd. inicial *", min_value=0, value=30, step=1)
-
-            n_min = c4.number_input("Estoque mín.", min_value=0, value=5, step=1)
-
-            n_cat = c5.text_input("Categoria", placeholder="Ex.: Brindes")
-
-            n_icon = st.text_input("Sigla (opcional)", placeholder="Ex.: SQZ", max_chars=12)
-
-
-
-            if st.form_submit_button("Adicionar ao inventário", type="primary"):
-
-                ok, msg = add_catalog_item(
-
-                    name=n_name,
-
-                    unit_price=n_price,
-
-                    icon=n_icon,
-
-                    category=n_cat,
-
-                    stock_qty=int(n_qty),
-
-                    min_stock=int(n_min),
-
-                    in_inventory=1,
-
-                )
-
-                notify("success" if ok else "warning", msg)
-
-                st.rerun()
-
-
-
-        hidden_items = [it for it in all_catalog if int(it.get("in_inventory", 1)) == 0]
-
-        if hidden_items:
-
-            st.markdown("**Reativar item existente do catálogo**")
-
-            r1, r2, r3 = st.columns([2.0, 1.0, 1.0])
-
-            sel_name = r1.selectbox(
-
-                "Item",
-
-                options=[it["name"] for it in hidden_items],
-
-                key="inv_reactivate_select",
-
-            )
-
-            sel_qty = r2.number_input("Quantidade", min_value=1, value=10, step=1, key="inv_reactivate_qty")
-
-            if r3.button("Reativar", key="inv_reactivate_btn", **STRETCH):
-
-                target = next(it for it in hidden_items if it["name"] == sel_name)
-
-                ok, msg = adjust_inventory_stock(
-
-                    item_id=int(target["id"]),
-
-                    exact_qty=int(sel_qty),
-
-                    reason="Reativado no inventario",
-
-                )
-
-                notify("success" if ok else "warning", msg)
-
-                st.rerun()
-
-
-
-    st.divider()
-
-    f1, f2 = st.columns([1.8, 1.2])
-
-    search_inv = f1.text_input("Buscar no inventário", placeholder="Nome ou categoria...", key="inv_search")
-
-    filter_inv = f2.selectbox(
-
-        "Filtrar situação",
-
-        ["Todos", "Disponível", "Estoque baixo", "Sem estoque"],
-
-        key="inv_filter_status",
-
-    )
-
-
-
-    term = search_inv.strip().lower()
-
-    filtered_inv = []
-
-    for it in inv_items:
-
-        qty = int(it.get("stock_qty", 0))
-
-        min_q = int(it.get("min_stock", 0))
-
-        st_lbl, _ = inventory_status_label(qty, min_q)
-
-        if filter_inv != "Todos" and st_lbl != filter_inv:
-
-            continue
-
-        if term and term not in it["name"].lower() and term not in str(it.get("category") or "").lower():
-
-            continue
-
-        filtered_inv.append(it)
-
-
-
-    with st.expander("Ver inventário em tabela"):
-
-        st.dataframe(pd.DataFrame(inventory_rows(filtered_inv, format_brl)), hide_index=True, **STRETCH)
-
-
-
-    if not filtered_inv:
-
-        st.info("Nenhum item encontrado no inventário para o filtro atual.")
-
+    # Adicionar novo item ao inventário
+    with st.expander("Adicionar novo brinde ao inventário", expanded=False):
+        with st.form("form_add_inventory_item", clear_on_submit=True):
+            c1, c2, c3, c4, c5 = st.columns([2.0, 0.9, 1.1, 1.0, 1.0])
+            with c1:
+                inv_name = st.text_input("Nome do brinde *", placeholder="Ex.: Mochila Executiva")
+            with c2:
+                inv_code = st.text_input("Sigla (3 letras)", max_chars=5, placeholder="MOC")
+            with c3:
+                inv_price = st.number_input("Valor unitário (R$)", min_value=0.0, value=0.0, step=1.0, format="%.2f")
+            with c4:
+                inv_stock = st.number_input("Estoque inicial", min_value=0, value=10, step=1)
+            with c5:
+                inv_min = st.number_input("Alerta mínimo", min_value=0, value=5, step=1)
+            inv_photo = st.file_uploader("Foto do brinde (opcional)", type=["png", "jpg", "jpeg", "webp"])
+            submitted_inv = st.form_submit_button("Cadastrar no Inventário", type="primary")
+            if submitted_inv:
+                if not inv_name.strip():
+                    st.error("Informe o nome do brinde.")
+                else:
+                    saved_path = save_uploaded_image(inv_photo)
+                    add_item(inv_name, inv_code, inv_price, int(inv_stock), int(inv_min), saved_path)
+                    st.success(f"Brinde '{inv_name}' adicionado ao inventário!")
+                    st.rerun()
+
+    st.markdown("### Saldo Atual por Brinde")
+    if not items:
+        st.info("Nenhum brinde cadastrado.")
     else:
-
-        for it in filtered_inv:
-
-            iid = int(it["id"])
-
-            qty = int(it.get("stock_qty", 0))
-
-            min_q = int(it.get("min_stock", 0))
-
-            unit = float(it.get("unit_price", 0.0))
-
-            st_lbl, chip_cls = inventory_status_label(qty, min_q)
-
-
+        for item in items:
+            iid = int(item["id"])
+            qty = int(item.get("stock_qty", 0))
+            min_s = int(item.get("min_stock", 5))
+            unit = float(item.get("unit_price", 0.0))
+            status_label = "Esgotado" if qty == 0 else ("Estoque Baixo" if qty <= min_s else "OK")
 
             with st.container(border=True):
-
-                c_vis, c_info, c_qty, c_actions = st.columns([0.65, 2.2, 1.3, 1.6], gap="medium")
-
-                with c_vis:
-
-                    render_item_visual(it, size=50)
-
-                with c_info:
-
-                    st.markdown(
-
-                        f"**{esc(it['name'])}** "
-
-                        f"<span class='chip chip-blue'>{esc(it.get('category') or 'Geral')}</span> "
-
-                        f"<span class='chip {chip_cls}'>{st_lbl}</span>",
-
-                        unsafe_allow_html=True,
-
+                c1, c2, c3, c4, c5, c6 = st.columns([2.1, 1.0, 1.1, 1.1, 0.85, 0.75])
+                with c1:
+                    st.markdown(f"**{item['name']}** `[{item['code']}]`")
+                    st.caption(f"Unitário: {format_brl(unit)} • Total parado: {format_brl(qty * unit)} • Status: **{status_label}**")
+                with c2:
+                    st.metric("Saldo", f"{qty} un.")
+                with c3:
+                    add_delta = st.number_input(
+                        "Repor/Retirar",
+                        min_value=-999,
+                        max_value=9999,
+                        value=0,
+                        step=1,
+                        key=f"delta_stock_{iid}",
+                        label_visibility="collapsed",
                     )
-
-                    st.caption(
-
-                        f"Unitário: {format_brl(unit)} · Total em estoque: {format_brl(qty * unit)} · Mínimo: {min_q} un."
-
+                with c4:
+                    if st.button("Aplicar ajuste", key=f"btn_adj_{iid}", use_container_width=True):
+                        if int(add_delta) != 0:
+                            adjust_item_stock(iid, int(add_delta), reason="Ajuste rápido na aba Inventário")
+                            st.rerun()
+                with c5:
+                    new_exact = st.number_input(
+                        "Definir saldo",
+                        min_value=0,
+                        max_value=99999,
+                        value=qty,
+                        step=1,
+                        key=f"exact_stock_{iid}",
+                        label_visibility="collapsed",
                     )
+                    if int(new_exact) != qty:
+                        update_item(iid, item["name"], item["code"], unit, int(new_exact), min_s)
+                        st.rerun()
+                with c6:
+                    if st.button("Excluir", key=f"del_inv_{iid}", use_container_width=True):
+                        delete_item(iid, hard_delete=False)
+                        st.rerun()
 
-                with c_qty:
+    st.markdown("### Últimas Movimentações de Estoque")
+    movements = list_stock_movements(limit=40)
+    if not movements:
+        st.caption("Nenhuma movimentação registrada ainda.")
+    else:
+        mov_df = pd.DataFrame([
+            {
+                "Data/Hora": m["created_at"],
+                "Brinde": m["item_name"],
+                "Tipo": m["movement_type"],
+                "Variação": f"+{m['qty_change']}" if int(m["qty_change"]) > 0 else str(m["qty_change"]),
+                "Saldo Após": m["balance_after"],
+                "Referência": m["reference_info"],
+            }
+            for m in movements
+        ])
+        st.dataframe(mov_df, use_container_width=True, hide_index=True)
 
-                    st.markdown(
 
-                        f"<div style='font-size:1.35rem;font-weight:800;'>{qty} un.</div>",
+# ==============================================================================
+# ABA 3: CATÁLOGO DE BRINDES E RECEITAS EDITÁVEIS
+# ==============================================================================
 
-                        unsafe_allow_html=True,
+def render_catalog_tab(items: List[Dict[str, Any]], recipes: List[Dict[str, Any]]) -> None:
+    col_cat, col_rec = st.columns([1.25, 1.0], gap="large")
 
-                    )
-
-                    q1, q2 = st.columns(2)
-
-                    q1.button(
-
-                        "-1",
-
-                        key=f"inv_dec_{iid}",
-
-                        disabled=qty <= 0,
-
-                        on_click=inv_quick_delta,
-
-                        args=(iid, -1, "Saida rapida (-1)"),
-
-                        **STRETCH,
-
-                    )
-
-                    q2.button(
-
-                        "+1",
-
-                        key=f"inv_inc_{iid}",
-
-                        on_click=inv_quick_delta,
-
-                        args=(iid, 1, "Entrada rapida (+1)"),
-
-                        **STRETCH,
-
-                    )
-
-                with c_actions:
-
-                    with st.popover("Alterar / Repor", **STRETCH):
-
-                        with st.form(f"inv_edit_form_{iid}"):
-
-                            ed_name = st.text_input("Nome", value=it["name"], key=f"inv_ed_name_{iid}")
-
-                            ed_price = st.number_input(
-
-                                "Valor unitário (R$)", min_value=0.0, value=unit, step=1.0, format="%.2f", key=f"inv_ed_price_{iid}"
-
+    with col_cat:
+        st.markdown(
+            """
+            <div class="section-card">
+                <div class="section-card-title">Catálogo de Brindes</div>
+                <div class="section-card-desc">Edite nomes, siglas, preços unitários e fotos dos brindes.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        for item in items:
+            iid = int(item["id"])
+            with st.expander(f"{item['name']} [{item['code']}] — {format_brl(item['unit_price'])}"):
+                with st.form(f"edit_item_form_{iid}"):
+                    c1, c2 = st.columns([2, 1])
+                    with c1:
+                        e_name = st.text_input("Nome", value=item["name"])
+                    with c2:
+                        e_code = st.text_input("Sigla", value=item["code"], max_chars=5)
+                    c3, c4, c5 = st.columns(3)
+                    with c3:
+                        e_price = st.number_input("Preço (R$)", min_value=0.0, value=float(item["unit_price"]), step=0.5, format="%.2f")
+                    with c4:
+                        e_stock = st.number_input("Estoque", min_value=0, value=int(item.get("stock_qty", 0)), step=1)
+                    with c5:
+                        e_min = st.number_input("Mínimo", min_value=0, value=int(item.get("min_stock", 5)), step=1)
+                    e_photo = st.file_uploader("Trocar foto (opcional)", type=["png", "jpg", "jpeg", "webp"], key=f"up_cat_{iid}")
+                    cs1, cs2 = st.columns(2)
+                    with cs1:
+                        if st.form_submit_button("Salvar alterações", type="primary", use_container_width=True):
+                            new_img = save_uploaded_image(e_photo) if e_photo is not None else None
+                            update_item(
+                                iid,
+                                e_name or item["name"],
+                                e_code or generate_code_from_name(e_name or item["name"]),
+                                e_price,
+                                int(e_stock),
+                                int(e_min),
+                                image_path=new_img,
                             )
+                            st.success("Brinde atualizado!")
+                            st.rerun()
+                    with cs2:
+                        if st.form_submit_button("Remover do catálogo", use_container_width=True):
+                            delete_item(iid, hard_delete=False)
+                            st.rerun()
 
-                            ed_cat = st.text_input(
-
-                                "Categoria", value=it.get("category") or "Geral", key=f"inv_ed_cat_{iid}"
-
+    with col_rec:
+        st.markdown(
+            """
+            <div class="section-card">
+                <div class="section-card-title">Receitas (Kits Padrão)</div>
+                <div class="section-card-desc">Edite as quantidades dos kits pré-definidos ou exclua receitas antigas.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if not recipes:
+            st.info("Nenhum Kit Padrão salvo ainda. Você pode criar um na aba 'Montagem do Kit'.")
+        else:
+            for rec in recipes:
+                rid = int(rec["id"])
+                rec_map = {int(x["item_id"]): int(x["quantity"]) for x in rec.get("items", [])}
+                with st.expander(f"{rec['name']}"):
+                    with st.form(f"edit_recipe_form_{rid}"):
+                        r_name = st.text_input("Nome da receita", value=rec["name"])
+                        r_desc = st.text_input("Descrição", value=rec.get("description", ""))
+                        updated_map: Dict[int, int] = {}
+                        for it in items:
+                            it_id = int(it["id"])
+                            updated_map[it_id] = st.number_input(
+                                f"{it['name']} ({format_brl(it['unit_price'])})",
+                                min_value=0,
+                                max_value=999,
+                                value=rec_map.get(it_id, 0),
+                                step=1,
+                                key=f"rec_item_{rid}_{it_id}",
                             )
-
-                            ed_qty = st.number_input(
-
-                                "Quantidade exata em estoque", min_value=0, value=qty, step=1, key=f"inv_ed_qty_{iid}"
-
-                            )
-
-                            ed_min = st.number_input(
-
-                                "Estoque mínimo para alerta", min_value=0, value=min_q, step=1, key=f"inv_ed_min_{iid}"
-
-                            )
-
-                            if st.form_submit_button("Salvar alterações", type="primary", **STRETCH):
-
-                                ok, msg = update_catalog_item(
-
-                                    item_id=iid,
-
-                                    name=ed_name,
-
-                                    unit_price=ed_price,
-
-                                    icon=it.get("icon") or "[ITEM]",
-
-                                    category=ed_cat,
-
-                                    image_path=it.get("image_path") or "",
-
-                                    stock_qty=int(ed_qty),
-
-                                    min_stock=int(ed_min),
-
-                                    in_inventory=1,
-
-                                )
-
-                                notify("success" if ok else "warning", msg)
-
+                        cr1, cr2 = st.columns(2)
+                        with cr1:
+                            if st.form_submit_button("Salvar receita", type="primary", use_container_width=True):
+                                if r_name.strip():
+                                    save_recipe(r_name, r_desc, updated_map, recipe_id=rid)
+                                    st.success("Receita atualizada!")
+                                    st.rerun()
+                        with cr2:
+                            if st.form_submit_button("Excluir receita", use_container_width=True):
+                                delete_recipe(rid)
                                 st.rerun()
 
 
-
-                    st.button(
-
-                        "Remover",
-
-                        key=f"inv_del_{iid}",
-
-                        on_click=inv_remove_direct,
-
-                        args=(iid,),
-
-                        **STRETCH,
-
-                    )
-
-
-
-    movements = get_inventory_movements(limit=30)
-
-    if movements:
-
-        with st.expander("Histórico recente de movimentações de estoque"):
-
-            mov_df = pd.DataFrame(
-
-                [
-
-                    {
-
-                        "Data": m["created_at"],
-
-                        "Item": m["item_name"],
-
-                        "Movimento": f"+{m['delta']}" if int(m["delta"]) > 0 else str(m["delta"]),
-
-                        "Saldo após": m["balance_after"],
-
-                        "Motivo": m["reason"],
-
-                    }
-
-                    for m in movements
-
-                ]
-
-            )
-
-            st.dataframe(mov_df, hide_index=True, **STRETCH)
-
-
-
-
-
-# ---- Catálogo: cadastro e edição -------------------------------------------
-
-
-
-
-
-def render_new_item_form() -> None:
-
-    st.markdown("#### Cadastrar novo brinde")
-
-    with st.form("add_catalog_form", clear_on_submit=True):
-
-        c1, c2, c3, c4, c5 = st.columns([1.8, 1.1, 0.9, 1.0, 1.3])
-
-        name = c1.text_input("Nome do brinde *", placeholder="Ex.: Mochila")
-
-        price = c2.number_input("Valor unitário (R$) *", min_value=0.0, value=20.0, step=1.0, format="%.2f")
-
-        stock = c3.number_input("Estoque inicial", min_value=0, value=20, step=1)
-
-        icon = c4.text_input("Sigla", placeholder="Ex.: MOC", max_chars=12)
-
-        category = c5.text_input("Categoria", placeholder="Ex.: Acessórios")
-
-        image = st.file_uploader("Imagem do brinde (opcional)", type=ALLOWED_IMAGE_TYPES, key="new_item_uploader")
-
-
-
-        if st.form_submit_button("Cadastrar brinde", type="primary"):
-
-            image_path = save_uploaded_image(image) if image else ""
-
-            ok, msg = add_catalog_item(
-
-                name=name,
-
-                unit_price=price,
-
-                icon=icon,
-
-                category=category,
-
-                image_path=image_path,
-
-                stock_qty=int(stock),
-
-                in_inventory=1,
-
-            )
-
-            notify("success" if ok else "warning", msg)
-
-            st.rerun()
-
-
-
-
-
-def render_edit_item(item: Item) -> None:
-
-    item_id = int(item["id"])
-
-    stock_qty = int(item.get("stock_qty", 0))
-
-    label = (
-
-        f"{item['name']}  ·  {format_brl(item['unit_price'])}  ·  "
-
-        f"{item.get('category') or 'Geral'}  ·  Estoque: {stock_qty} un."
-
+# ==============================================================================
+# ABA 4: HISTÓRICO DE KITS FINALIZADOS E EXPORTAÇÃO (4 COLUNAS)
+# ==============================================================================
+
+def render_history_tab(items: List[Dict[str, Any]]) -> None:
+    st.markdown(
+        """
+        <div class="section-card">
+            <div class="section-card-title">Histórico de Kits Finalizados</div>
+            <div class="section-card-desc">Exporte a planilha pronta (Itens e quantidades, Nome, Endereço, Valor), edite ou exclua kits com estorno automático de estoque.</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
-    with st.expander(label):
+    c_search, c_xlsx, c_csv, c_clear = st.columns([2.1, 1.05, 1.05, 0.95])
+    with c_search:
+        q = st.text_input(
+            "Buscar no histórico",
+            placeholder="Filtrar por nome, endereço, observação ou brinde...",
+            label_visibility="collapsed",
+        )
 
-        c_img, c_form = st.columns([1.0, 3.2], gap="medium")
+    kits = list_kits(search_query=q)
+    df_export = build_kits_dataframe(kits)
 
-        with c_img:
+    with c_xlsx:
+        st.download_button(
+            "Baixar Excel (.xlsx)",
+            data=dataframe_to_excel_bytes(df_export, sheet_name="Kits_Momento_Uau"),
+            file_name=f"kits_momento_uau_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+            use_container_width=True,
+        )
+    with c_csv:
+        st.download_button(
+            "Baixar CSV (.csv)",
+            data=df_export.to_csv(index=False, sep=";").encode("utf-8-sig"),
+            file_name=f"kits_momento_uau_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+    with c_clear:
+        if st.button("Limpar tudo", use_container_width=True, disabled=len(kits) == 0):
+            clear_all_kits(restore_stock=True)
+            st.rerun()
 
-            render_item_visual(item, size=92)
+    if not kits:
+        st.info("Nenhum kit encontrado no histórico.")
+        return
 
+    st.markdown("#### Prévia da Planilha de Exportação")
+    st.dataframe(df_export, use_container_width=True, hide_index=True)
 
-
-        with c_form:
-
-            with st.form(f"edit_catalog_form_{item_id}"):
-
-                f1, f2, f3, f4, f5 = st.columns([1.8, 1.1, 0.9, 1.0, 1.3])
-
-                name = f1.text_input("Nome", value=item["name"], key=f"ed_name_{item_id}")
-
-                price = f2.number_input(
-
-                    "Valor unitário (R$)", min_value=0.0, value=float(item["unit_price"]),
-
-                    step=1.0, format="%.2f", key=f"ed_price_{item_id}",
-
-                )
-
-                stock = f3.number_input(
-
-                    "Estoque (un.)", min_value=0, value=stock_qty, step=1, key=f"ed_stock_{item_id}",
-
-                )
-
-                icon = f4.text_input(
-
-                    "Sigla", value=icon_for_input(item), max_chars=12, key=f"ed_icon_{item_id}"
-
-                )
-
-                category = f5.text_input(
-
-                    "Categoria", value=item.get("category") or "Geral", key=f"ed_cat_{item_id}"
-
-                )
-
-                upload = st.file_uploader(
-
-                    "Substituir imagem (opcional)", type=ALLOWED_IMAGE_TYPES, key=f"ed_upload_{item_id}"
-
-                )
-
-                if st.form_submit_button("Salvar alterações"):
-
-                    image_path = item.get("image_path") or ""
-
-                    if upload is not None:
-
-                        image_path = save_uploaded_image(upload)
-
-                    ok, msg = update_catalog_item(
-
-                        item_id=item_id,
-
-                        name=name,
-
-                        unit_price=price,
-
-                        icon=icon,
-
-                        category=category,
-
-                        image_path=image_path,
-
-                        stock_qty=int(stock),
-
-                    )
-
-                    notify("success" if ok else "warning", msg)
-
+    st.markdown("#### Kits Registrados (Editar ou Excluir Direto)")
+    for kit in kits:
+        kid = int(kit["id"])
+        summary_txt = format_items_summary(kit.get("items", []))
+        with st.container(border=True):
+            c1, c2, c3, c4 = st.columns([2.3, 1.1, 0.75, 0.75])
+            with c1:
+                st.markdown(f"**#{kid} — {kit['recipient_name']}**")
+                st.caption(f"Endereço: {kit.get('recipient_address') or 'Não informado'}")
+                st.markdown(f"<span style='font-size:0.86rem;'>{summary_txt}</span>", unsafe_allow_html=True)
+                if kit.get("notes"):
+                    st.caption(f"Obs.: {kit['notes']}")
+            with c2:
+                st.markdown(f"<div style='font-size:1.15rem;font-weight:800;color:#3B82F6;'>{format_brl(kit['total_value'])}</div>", unsafe_allow_html=True)
+                st.caption(kit.get("created_at", ""))
+            with c3:
+                if st.button("Editar", key=f"edit_kit_btn_{kid}", use_container_width=True):
+                    load_kit_for_editing(kit, items)
+                    st.rerun()
+            with c4:
+                if st.button("Excluir", key=f"del_kit_btn_{kid}", use_container_width=True):
+                    delete_kit(kid, restore_stock=True)
                     st.rerun()
 
 
-
-            if st.button("Excluir brinde", key=f"del_catalog_item_{item_id}"):
-
-                ok, msg = delete_catalog_item(
-
-                    item_id=item_id, active_kit_items=st.session_state.kit_items
-
-                )
-
-                notify("success" if ok else "warning", msg)
-
-                st.rerun()
-
-
-
-
-
-def history_rows(history: list[Item], money: Callable[[float], Any]) -> list[dict[str, Any]]:
-
-    return [
-
-        {
-
-            "Kit": k["kit_code"],
-
-            "Cliente": k["client_name"],
-
-            "Endereço": k.get("address_summary") or format_address_summary(k),
-
-            "Itens": k["items_summary"],
-
-            "Quantidade total": k["total_quantity"],
-
-            "Valor": money(k["total_value"]),
-
-            "Status": k["status"],
-
-            "Data": k["created_at"],
-
-            "Observações": k.get("notes") or "",
-
-        }
-
-        for k in history
-
-    ]
-
-
-
-
-
-def build_excel_bytes(history: list[Item]) -> bytes:
-
-    df = pd.DataFrame(history_rows(history, float))
-
-    output = io.BytesIO()
-
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-
-        df.to_excel(writer, index=False, sheet_name="Historico_Kits")
-
-        if not df.empty:
-
-            ws = writer.sheets["Historico_Kits"]
-
-            value_col = list(df.columns).index("Valor") + 1
-
-            for row in range(2, ws.max_row + 1):
-
-                ws.cell(row=row, column=value_col).number_format = "R$ #,##0.00"
-
-            for idx, col in enumerate(df.columns, start=1):
-
-                longest = max(len(str(col)), *(len(str(v)) for v in df[col]))
-
-                ws.column_dimensions[get_column_letter(idx)].width = min(longest + 2, 60)
-
-    return output.getvalue()
-
-
-
-
-
-def build_csv_bytes(history: list[Item]) -> bytes:
-
-    df = pd.DataFrame(history_rows(history, format_brl))
-
-    return df.to_csv(index=False, sep=";").encode("utf-8-sig")
-
-
-
-
-
-def render_kit_card(kit: Item) -> None:
-
-    kid = int(kit["id"])
-
-    address = kit.get("address_summary") or format_address_summary(kit)
-
-    chip = STATUS_CHIP.get(kit["status"], "chip")
-
-
-
-    with st.container(border=True):
-
-        left, right = st.columns([3.2, 1.2])
-
-        with left:
-
-            st.markdown(
-
-                f"**{esc(kit['kit_code'])}** · {esc(kit['client_name'])} "
-
-                f"<span class='chip {chip}'>{esc(kit['status'])}</span>",
-
-                unsafe_allow_html=True,
-
-            )
-
-            st.caption(f"Itens: {kit['items_summary']}")
-
-            details = [f"Data: {kit['created_at']}"]
-
-            if address:
-
-                details.append(f"Endereço: {address}")
-
-            if kit.get("notes"):
-
-                details.append(f"Obs.: {kit['notes']}")
-
-            st.caption("  |  ".join(details))
-
-        with right:
-
-            st.markdown(
-
-                f"<div class='kit-value'>{format_brl(kit['total_value'])}</div>"
-
-                f"<div class='kit-meta'>{kit['total_quantity']} itens</div>",
-
-                unsafe_allow_html=True,
-
-            )
-
-
-
-        b1, b2, b3, _ = st.columns([1.0, 1.0, 1.0, 2.2])
-
-        b1.button(
-
-            "Editar", key=f"edit_kit_{kid}", type="primary",
-
-            on_click=load_kit_for_edit, args=(kit,), **STRETCH,
-
-        )
-
-        b2.button("Duplicar", key=f"dup_kit_{kid}", on_click=duplicate_kit, args=(kit,), **STRETCH)
-
-        b3.button("Excluir", key=f"del_kit_{kid}", on_click=delete_kit_direct, args=(kid,), **STRETCH)
-
-
-
-
-
-def render_history(history: list[Item]) -> None:
-
-    st.markdown("#### Histórico de kits")
-
-    if not history:
-
-        st.info("Nenhum kit registrado ainda.")
-
-        return
-
-
-
-    m1, m2, m3 = st.columns(3)
-
-    m1.metric("Kits registrados", len(history))
-
-    m2.metric("Itens no total", sum(int(k["total_quantity"]) for k in history))
-
-    m3.metric("Valor acumulado", format_brl(sum(float(k["total_value"]) for k in history)))
-
-
-
-    f1, f2, f3, f4 = st.columns([2.0, 1.2, 1.0, 1.0])
-
-    search = f1.text_input("Buscar kit ou cliente", placeholder="Ex.: Kit 3, nome do cliente…", key="hist_search")
-
-    status = f2.selectbox("Status", ["Todos"] + STATUS_OPTIONS, key="hist_status")
-
-    f3.write("")
-
-    f4.write("")
-
-    f3.download_button(
-
-        "Exportar Excel",
-
-        data=build_excel_bytes(history),
-
-        file_name="historico_kits_momento_uau.xlsx",
-
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-
-        **STRETCH,
-
-    )
-
-    f4.download_button(
-
-        "Exportar CSV",
-
-        data=build_csv_bytes(history),
-
-        file_name="historico_kits_momento_uau.csv",
-
-        mime="text/csv",
-
-        **STRETCH,
-
-    )
-
-
-
-    term = search.strip().lower()
-
-    filtered = [
-
-        k
-
-        for k in history
-
-        if (status == "Todos" or k["status"] == status)
-
-        and (
-
-            not term
-
-            or term in str(k["kit_code"]).lower()
-
-            or term in str(k["client_name"]).lower()
-
-            or term in str(k["items_summary"]).lower()
-
-        )
-
-    ]
-
-
-
-    with st.expander("Ver como tabela"):
-
-        table = pd.DataFrame(history_rows(filtered, format_brl)).drop(columns=["Observações"], errors="ignore")
-
-        st.dataframe(table, hide_index=True, **STRETCH)
-
-
-
-    st.caption(f"{len(filtered)} de {len(history)} kits")
-
-    if not filtered:
-
-        st.info("Nenhum kit encontrado para o filtro atual.")
-
-    for kit in filtered:
-
-        render_kit_card(kit)
-
-
-
-
-
-# =============================================================================
-
-# 6. PÁGINAS
-
-# =============================================================================
-
-
-
-
-
-def page_assembly(catalog: list[Item], catalog_by_id: dict[int, Item], recipes: list[Item]) -> None:
-
-    col_left, col_right = st.columns([1.22, 1.0], gap="large")
-
-    with col_left:
-
-        render_recipes(recipes, catalog, catalog_by_id)
-
-        st.write("")
-
-        render_catalog_cards(catalog)
-
-    with col_right:
-
-        render_kit_panel(catalog_by_id)
-
-
-
-
-
-def page_catalog(catalog: list[Item]) -> None:
-
-    render_new_item_form()
-
-    st.divider()
-
-    st.markdown("#### Editar ou excluir brindes")
-
-    if not catalog:
-
-        st.info("Nenhum brinde cadastrado.")
-
-    for item in catalog:
-
-        render_edit_item(item)
-
-
-
-
-
-# =============================================================================
-
-# 7. FUNÇÃO PRINCIPAL
-
-# =============================================================================
-
-
-
-
+# ==============================================================================
+# APLICAÇÃO PRINCIPAL
+# ==============================================================================
 
 def main() -> None:
-
-    st.set_page_config(page_title=f"{APP_TITLE} – Momento Uau", layout="wide")
-
-    render_styles()
-
-    init_db()
-
-    init_session_state()
-
-
-
-    catalog = get_catalog_items()
-
-    catalog_by_id = {int(item["id"]): item for item in catalog}
-
-    inv_items = get_inventory_items()
-
-    recipes = get_recipes()
-
-    history = get_kits_history()
-
-
-
-    st.session_state.kit_items = {
-
-        int(k): int(v)
-
-        for k, v in st.session_state.kit_items.items()
-
-        if int(k) in catalog_by_id and int(v) > 0
-
-    }
-
-
-
-    total_stock = sum(int(it.get("stock_qty", 0)) for it in inv_items)
-
-    low_stock_count = sum(
-
-        1 for it in inv_items if int(it.get("stock_qty", 0)) <= int(it.get("min_stock", 0))
-
+    st.set_page_config(
+        page_title="Montador Visual de Kits – Momento Uau",
+        page_icon="🎁",
+        layout="wide",
+        initial_sidebar_state="collapsed",
     )
 
-    current_totals = compute_totals(st.session_state.kit_items, catalog_by_id)
+    init_db(DEFAULT_DB_PATH)
+    inject_modern_blue_css()
 
+    items = list_items(active_only=True)
+    recipes = list_recipes()
+    kits_all = list_kits()
+    ensure_session_state(items)
 
+    db_badge = "PostgreSQL Cloud Conectado" if is_postgres_enabled() else "Banco Local SQLite"
 
-    show_flash()
+    # Topbar SaaS
+    st.markdown(
+        f"""
+        <div class="uau-topbar">
+            <div class="uau-brand-group">
+                <div class="uau-logo-badge">UAU</div>
+                <div>
+                    <h1 class="uau-title">Montador Visual de Kits – Momento Uau</h1>
+                    <p class="uau-subtitle">Montagem visual, cálculo automático em R$, baixa inteligente de inventário e exportação pronta</p>
+                </div>
+            </div>
+            <div class="uau-status-pill">● {db_badge}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    render_header(len(history), total_stock)
+    # Navegação em Pílula
+    nav_options = ["Montagem do Kit", "Inventário", "Catálogo e Brindes", "Histórico"]
+    selected_nav = st.radio(
+        "Navegação",
+        options=nav_options,
+        horizontal=True,
+        key="active_nav",
+        label_visibility="collapsed",
+    )
 
-    page = render_nav(len(history), total_stock)
+    # Faixa superior de KPIs arredondados
+    total_kits_count = len(kits_all)
+    total_kits_value = sum(float(k.get("total_value", 0.0)) for k in kits_all)
+    total_stock_units = sum(int(i.get("stock_qty", 0)) for i in items)
+    low_stock_count = sum(1 for i in items if int(i.get("stock_qty", 0)) <= int(i.get("min_stock", 5)))
+    current_kit_val = sum(
+        float(i["unit_price"]) * int(st.session_state["kit_quantities"].get(int(i["id"]), 0))
+        for i in items
+    )
 
-    render_top_kpis(current_totals, total_stock, low_stock_count, history)
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        st.markdown(
+            f"""
+            <div class="kpi-card kpi-card-accent">
+                <div class="kpi-label">Kit Atual em Montagem</div>
+                <div class="kpi-value kpi-value-blue">{format_brl(current_kit_val)}</div>
+                <div class="kpi-foot">Atualizado automaticamente</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with k2:
+        st.markdown(
+            f"""
+            <div class="kpi-card">
+                <div class="kpi-label">Kits Finalizados</div>
+                <div class="kpi-value">{total_kits_count}</div>
+                <div class="kpi-foot">Prontos para exportação</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with k3:
+        st.markdown(
+            f"""
+            <div class="kpi-card">
+                <div class="kpi-label">Acumulado em Kits</div>
+                <div class="kpi-value">{format_brl(total_kits_value)}</div>
+                <div class="kpi-foot">Soma do histórico salvo</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with k4:
+        st.markdown(
+            f"""
+            <div class="kpi-card">
+                <div class="kpi-label">Brindes em Inventário</div>
+                <div class="kpi-value">{total_stock_units} un.</div>
+                <div class="kpi-foot">{low_stock_count} item(ns) em alerta mínimo</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
-    render_last_summary()
+    st.markdown("<div style='height:0.65rem;'></div>", unsafe_allow_html=True)
 
-
-
-    if page == "montagem":
-
-        page_assembly(catalog, catalog_by_id, recipes)
-
-    elif page == "inventario":
-
-        page_inventory(inv_items, catalog)
-
-    elif page == "catalogo":
-
-        page_catalog(catalog)
-
-    else:
-
-        render_history(history)
-
-
-
+    if selected_nav == "Montagem do Kit":
+        render_builder_tab(items, recipes)
+    elif selected_nav == "Inventário":
+        render_inventory_tab(items)
+    elif selected_nav == "Catálogo e Brindes":
+        render_catalog_tab(items, recipes)
+    elif selected_nav == "Histórico":
+        render_history_tab(items)
 
 
 if __name__ == "__main__":
-
     main()
