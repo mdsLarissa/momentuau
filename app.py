@@ -80,9 +80,9 @@ from database import (
 
 
 
-APP_TITLE = "Montador Visual de Kits"
+APP_TITLE = "Kits Momento Uau"
 
-APP_SUBTITLE = "Momento Uau · montagem visual, controle de inventário e cálculo automático"
+APP_SUBTITLE = "Montagem visual, controle de inventário e cálculo automático"
 
 
 
