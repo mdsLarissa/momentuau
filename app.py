@@ -1,15 +1,3 @@
-"""Montador Visual de Kits – Momento Uau.
-
-Organização deste arquivo:
-1. Configuração e constantes
-2. Utilidades (formatação, imagens, cálculos, exportação)
-3. Estado e ações (callbacks)
-4. Estilos (CSS)
-5. Componentes de interface
-6. Páginas (Montagem, Catálogo, Histórico)
-7. Função principal
-"""
-
 from __future__ import annotations
 
 import html
@@ -29,14 +17,18 @@ from PIL import Image
 from database import (
     ASSETS_DIR,
     add_catalog_item,
+    adjust_inventory_stock,
     delete_catalog_item,
     delete_kit,
     delete_recipe,
     format_address_summary,
     get_catalog_items,
+    get_inventory_items,
+    get_inventory_movements,
     get_kits_history,
     get_recipes,
     init_db,
+    remove_from_inventory,
     save_kit,
     save_recipe,
     update_catalog_item,
@@ -48,7 +40,7 @@ from database import (
 # =============================================================================
 
 APP_TITLE = "Montador Visual de Kits"
-APP_SUBTITLE = "Momento Uau · seleção visual de brindes e cálculo automático"
+APP_SUBTITLE = "Momento Uau · seleção visual de brindes, inventário e cálculo automático"
 
 STATUS_OPTIONS = ["Em montagem", "Conferido", "Finalizado"]
 STATUS_CHIP = {"Em montagem": "chip-warn", "Conferido": "chip-info", "Finalizado": "chip-ok"}
@@ -57,6 +49,7 @@ ALLOWED_IMAGE_TYPES = ["png", "jpg", "jpeg", "webp"]
 
 PAGES = {
     "montagem": "Montagem do kit",
+    "inventario": "Inventário",
     "catalogo": "Catálogo e brindes",
     "historico": "Histórico",
 }
@@ -212,6 +205,58 @@ def build_batch_tsv(summaries: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def inventory_status_label(stock_qty: int, min_stock: int) -> tuple[str, str]:
+    if stock_qty <= 0:
+        return "Sem estoque", "chip-danger"
+    if stock_qty <= min_stock:
+        return "Estoque baixo", "chip-warn"
+    return "Disponível", "chip-ok"
+
+
+def inventory_rows(items: list[Item], money: Callable[[float], Any]) -> list[dict[str, Any]]:
+    rows = []
+    for it in items:
+        qty = int(it.get("stock_qty", 0))
+        min_q = int(it.get("min_stock", 0))
+        unit = float(it.get("unit_price", 0.0))
+        status_text, _ = inventory_status_label(qty, min_q)
+        rows.append(
+            {
+                "Item": it["name"],
+                "Categoria": it.get("category") or "Geral",
+                "Quantidade em estoque": qty,
+                "Estoque mínimo": min_q,
+                "Situação": status_text,
+                "Valor unitário": money(unit),
+                "Valor total em estoque": money(round(qty * unit, 2)),
+            }
+        )
+    return rows
+
+
+def build_inventory_excel_bytes(items: list[Item]) -> bytes:
+    df = pd.DataFrame(inventory_rows(items, float))
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Inventario_Brindes")
+        ws = writer.sheets["Inventario_Brindes"]
+        if not df.empty:
+            unit_col = list(df.columns).index("Valor unitário") + 1
+            tot_col = list(df.columns).index("Valor total em estoque") + 1
+            for r_idx in range(2, ws.max_row + 1):
+                ws.cell(row=r_idx, column=unit_col).number_format = "R$ #,##0.00"
+                ws.cell(row=r_idx, column=tot_col).number_format = "R$ #,##0.00"
+            for idx, col in enumerate(df.columns, start=1):
+                longest = max(len(str(col)), *(len(str(v)) for v in df[col]))
+                ws.column_dimensions[get_column_letter(idx)].width = min(longest + 3, 55)
+    return output.getvalue()
+
+
+def build_inventory_csv_bytes(items: list[Item]) -> bytes:
+    df = pd.DataFrame(inventory_rows(items, format_brl))
+    return df.to_csv(index=False, sep=";").encode("utf-8-sig")
+
+
 def _empty_recipient(kit_code: str = "", status: str = "") -> dict[str, str]:
     return {
         "kit_code": kit_code,
@@ -259,7 +304,6 @@ def init_session_state() -> None:
 
 
 def set_form(**values: str) -> None:
-    """Substitui todos os campos do formulário e recria os widgets."""
     ss = st.session_state
     for name in FORM_FIELDS:
         ss[f"form_{name}"] = str(values.get(name) or "")
@@ -269,7 +313,6 @@ def set_form(**values: str) -> None:
 
 
 def current_form() -> dict[str, str]:
-    """Valores atuais do formulário, inclusive o que foi digitado agora."""
     ss = st.session_state
     nonce = ss.form_nonce
     return {
@@ -401,7 +444,6 @@ def remove_recipe_direct(recipe_id: int) -> None:
 
 
 def reset_kit() -> None:
-    """Esvazia o kit e o formulário (também cancela uma edição em andamento)."""
     st.session_state.kit_items = {}
     st.session_state.editing_kit_id = None
     set_form(kit_code=suggest_next_kit_code(get_kits_history()))
@@ -476,6 +518,20 @@ def finalize_batch_kits() -> None:
         notify("warning", "Informe o nome de pelo menos 1 destinatário para gerar os kits.")
         return
 
+    # Valida estoque total necessario para todo o lote antes de salvar
+    count_kits = len(filled_rows)
+    for line in totals.lines:
+        cat_item = line["item"]
+        needed_total = int(line["quantity"]) * count_kits
+        avail = int(cat_item.get("stock_qty", 0))
+        if avail < needed_total:
+            notify(
+                "warning",
+                f"Estoque insuficiente de '{cat_item['name']}' para {count_kits} kits "
+                f"(disponível: {avail}, necessário: {needed_total}).",
+            )
+            return
+
     items_summary = ", ".join(
         f"{line['quantity']}x {line['item']['name']}" for line in totals.lines
     )
@@ -522,7 +578,7 @@ def finalize_batch_kits() -> None:
     ss.editing_kit_id = None
     set_form(kit_code=suggest_next_kit_code(get_kits_history()))
     reset_batch_recipients()
-    notify("success", f"{len(saved_summaries)} kits gerados e salvos no histórico.")
+    notify("success", f"{len(saved_summaries)} kits gerados e baixados do inventário.")
 
 
 def load_kit_for_edit(kit: Item) -> None:
@@ -575,6 +631,16 @@ def delete_kit_direct(kit_id: int) -> None:
     ok, msg = delete_kit(kit_id)
     if ok and st.session_state.editing_kit_id == kit_id:
         reset_kit()
+    notify("success" if ok else "warning", msg)
+
+
+def inv_quick_delta(item_id: int, delta: int, reason: str) -> None:
+    ok, msg = adjust_inventory_stock(item_id=item_id, delta=delta, reason=reason)
+    notify("success" if ok else "warning", msg)
+
+
+def inv_remove_direct(item_id: int) -> None:
+    ok, msg = remove_from_inventory(item_id=item_id, active_kit_items=st.session_state.kit_items)
     notify("success" if ok else "warning", msg)
 
 
@@ -632,9 +698,10 @@ CSS = """
         padding: 2px 10px; border-radius: 999px;
         background: rgba(99,102,241,0.12); color: #6366f1;
     }
-    .chip-warn { background: rgba(245,158,11,0.16); color: #b45309; }
-    .chip-info { background: rgba(59,130,246,0.16); color: #1d4ed8; }
-    .chip-ok   { background: rgba(16,185,129,0.16); color: #047857; }
+    .chip-warn   { background: rgba(245,158,11,0.16); color: #b45309; }
+    .chip-info   { background: rgba(59,130,246,0.16); color: #1d4ed8; }
+    .chip-ok     { background: rgba(16,185,129,0.16); color: #047857; }
+    .chip-danger { background: rgba(239,68,68,0.16); color: #b91c1c; }
     .qty-badge {
         display: inline-block; background: #4f46e5; color: #fff;
         font-size: 0.78rem; font-weight: 700; padding: 1px 10px; border-radius: 999px;
@@ -672,7 +739,7 @@ def render_item_visual(item: Item, size: int = 56) -> None:
     )
 
 
-def render_header(history_count: int) -> None:
+def render_header(history_count: int, total_stock: int) -> None:
     in_block = history_count % MAX_BATCH_KITS
     st.markdown(
         f"""
@@ -681,15 +748,16 @@ def render_header(history_count: int) -> None:
                 <div class="hero-title">{APP_TITLE}</div>
                 <div class="hero-sub">{APP_SUBTITLE}</div>
             </div>
-            <div class="hero-pill">Bloco atual: {in_block}/{MAX_BATCH_KITS} kits</div>
+            <div class="hero-pill">Bloco: {in_block}/{MAX_BATCH_KITS} kits · Estoque: {total_stock} un.</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
 
-def render_nav(history_count: int) -> str:
+def render_nav(history_count: int, total_stock: int) -> str:
     labels = dict(PAGES)
+    labels["inventario"] = f"{PAGES['inventario']} ({total_stock})"
     labels["historico"] = f"{PAGES['historico']} ({history_count})"
     return st.radio(
         "Navegação",
@@ -707,7 +775,7 @@ def render_last_summary() -> None:
         with st.container(border=True):
             total_lote = sum(float(s.get("total_value", 0.0)) for s in batch)
             st.success(
-                f"**{len(batch)} kits gerados e salvos.** "
+                f"**{len(batch)} kits gerados e baixados do inventário.** "
                 f"Valor total do lote: {format_brl(total_lote)}."
             )
             st.caption(
@@ -736,7 +804,7 @@ def render_last_summary() -> None:
             st.success(f"**{summary['kit_code']} atualizado.** Novo valor: {format_brl(summary['total_value'])}.")
         else:
             st.success(
-                f"**{summary['kit_code']} finalizado.** "
+                f"**{summary['kit_code']} finalizado e baixado do inventário.** "
                 f"Registre {format_brl(summary['total_value'])} no formulário."
             )
 
@@ -854,13 +922,18 @@ def render_catalog_cards(catalog: list[Item]) -> None:
         for col, item in zip(cols, row):
             item_id = int(item["id"])
             in_kit = int(st.session_state.kit_items.get(item_id, 0))
+            stock_qty = int(item.get("stock_qty", 0))
+            min_stock = int(item.get("min_stock", 0))
+            _, stock_chip = inventory_status_label(stock_qty, min_stock)
+
             with col, st.container(border=True):
                 c_vis, c_info = st.columns([0.9, 2.1])
                 with c_vis:
                     render_item_visual(item, size=60)
                 with c_info:
                     st.markdown(
-                        f"<span class='chip'>{esc(item.get('category') or 'Geral')}</span>",
+                        f"<span class='chip'>{esc(item.get('category') or 'Geral')}</span> "
+                        f"<span class='chip {stock_chip}'>Estoque: {stock_qty}</span>",
                         unsafe_allow_html=True,
                     )
                     st.markdown(f"**{esc(item['name'])}**")
@@ -919,12 +992,22 @@ def render_total_card(totals: KitTotals, recipients_count: int = 1) -> None:
     )
 
 
-def render_gift_box(totals: KitTotals) -> None:
+def render_gift_box(totals: KitTotals, multiplier: int = 1) -> None:
     with st.container(border=True):
         st.markdown("<span class='box-title'>Caixa de brindes</span>", unsafe_allow_html=True)
         if not totals.lines:
             st.caption("Caixa vazia. Adicione itens do catálogo ou aplique uma receita.")
             return
+
+        low_warnings = []
+        for line in totals.lines:
+            avail = int(line["item"].get("stock_qty", 0))
+            needed = int(line["quantity"]) * max(1, multiplier)
+            if avail < needed:
+                low_warnings.append(f"{line['item']['name']} (disponível: {avail}, necessário: {needed})")
+        if low_warnings:
+            st.warning("Estoque insuficiente para finalizar: " + ", ".join(low_warnings))
+
         for row in chunked(totals.lines, 3):
             cols = st.columns(3, gap="small")
             for col, line in zip(cols, row):
@@ -1106,7 +1189,7 @@ def render_kit_panel(catalog_by_id: dict[int, Item]) -> None:
     if ss.batch_mode and not editing:
         active_people = render_batch_form()
         render_total_card(totals, recipients_count=active_people)
-        render_gift_box(totals)
+        render_gift_box(totals, multiplier=active_people)
         st.write("")
         a1, a2 = st.columns([1.6, 1.0])
         a1.button(
@@ -1121,7 +1204,7 @@ def render_kit_panel(catalog_by_id: dict[int, Item]) -> None:
         return
 
     render_total_card(totals, recipients_count=1)
-    render_gift_box(totals)
+    render_gift_box(totals, multiplier=1)
     render_kit_form()
 
     st.write("")
@@ -1137,20 +1220,240 @@ def render_kit_panel(catalog_by_id: dict[int, Item]) -> None:
     a2.button("Limpar", key="btn_clear_kit", on_click=reset_kit, **STRETCH)
 
 
+# ---- Inventário -------------------------------------------------------------
+
+
+def page_inventory(inv_items: list[Item], all_catalog: list[Item]) -> None:
+    st.markdown("#### Controle de inventário")
+    st.caption(
+        "A cada kit finalizado (individual ou em lote), o estoque é reduzido automaticamente. "
+        "Se um kit for editado ou excluído no histórico, o saldo é recalculado."
+    )
+
+    total_units = sum(int(it.get("stock_qty", 0)) for it in inv_items)
+    total_stock_value = sum(
+        int(it.get("stock_qty", 0)) * float(it.get("unit_price", 0.0)) for it in inv_items
+    )
+    low_count = sum(
+        1 for it in inv_items if int(it.get("stock_qty", 0)) <= int(it.get("min_stock", 0))
+    )
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Brindes no inventário", len(inv_items))
+    m2.metric("Unidades disponíveis", total_units)
+    m3.metric("Valor total em estoque", format_brl(total_stock_value), delta=f"{low_count} em alerta" if low_count else None, delta_color="inverse" if low_count else "off")
+
+    st.write("")
+    exp1, exp2, _ = st.columns([1.1, 1.1, 2.2])
+    exp1.download_button(
+        "Exportar inventário Excel (.xlsx)",
+        data=build_inventory_excel_bytes(inv_items),
+        file_name="inventario_brindes_momento_uau.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        **STRETCH,
+    )
+    exp2.download_button(
+        "Exportar inventário CSV (.csv)",
+        data=build_inventory_csv_bytes(inv_items),
+        file_name="inventario_brindes_momento_uau.csv",
+        mime="text/csv",
+        **STRETCH,
+    )
+
+    with st.expander("Adicionar novo item ao inventário", expanded=False):
+        with st.form("inv_add_item_form", clear_on_submit=True):
+            c1, c2, c3, c4, c5 = st.columns([2.0, 1.1, 1.0, 1.0, 1.3])
+            n_name = c1.text_input("Nome do item *", placeholder="Ex.: Squeezes")
+            n_price = c2.number_input("Valor unit. (R$) *", min_value=0.0, value=25.0, step=1.0, format="%.2f")
+            n_qty = c3.number_input("Qtd. inicial *", min_value=0, value=30, step=1)
+            n_min = c4.number_input("Estoque mín.", min_value=0, value=5, step=1)
+            n_cat = c5.text_input("Categoria", placeholder="Ex.: Brindes")
+            n_icon = st.text_input("Sigla (opcional)", placeholder="Ex.: SQZ", max_chars=12)
+
+            if st.form_submit_button("Adicionar ao inventário", type="primary"):
+                ok, msg = add_catalog_item(
+                    name=n_name,
+                    unit_price=n_price,
+                    icon=n_icon,
+                    category=n_cat,
+                    stock_qty=int(n_qty),
+                    min_stock=int(n_min),
+                    in_inventory=1,
+                )
+                notify("success" if ok else "warning", msg)
+                st.rerun()
+
+        # Reativar itens que estavam no catalogo mas fora do inventario
+        hidden_items = [it for it in all_catalog if int(it.get("in_inventory", 1)) == 0]
+        if hidden_items:
+            st.markdown("**Reativar item existente do catálogo**")
+            r1, r2, r3 = st.columns([2.0, 1.0, 1.0])
+            sel_name = r1.selectbox(
+                "Item",
+                options=[it["name"] for it in hidden_items],
+                key="inv_reactivate_select",
+            )
+            sel_qty = r2.number_input("Quantidade", min_value=1, value=10, step=1, key="inv_reactivate_qty")
+            if r3.button("Reativar", key="inv_reactivate_btn", **STRETCH):
+                target = next(it for it in hidden_items if it["name"] == sel_name)
+                ok, msg = adjust_inventory_stock(
+                    item_id=int(target["id"]),
+                    exact_qty=int(sel_qty),
+                    reason="Reativado no inventario",
+                )
+                notify("success" if ok else "warning", msg)
+                st.rerun()
+
+    st.divider()
+    f1, f2 = st.columns([1.8, 1.2])
+    search_inv = f1.text_input("Buscar no inventário", placeholder="Nome ou categoria...", key="inv_search")
+    filter_inv = f2.selectbox(
+        "Filtrar situação",
+        ["Todos", "Disponível", "Estoque baixo", "Sem estoque"],
+        key="inv_filter_status",
+    )
+
+    term = search_inv.strip().lower()
+    filtered_inv = []
+    for it in inv_items:
+        qty = int(it.get("stock_qty", 0))
+        min_q = int(it.get("min_stock", 0))
+        st_lbl, _ = inventory_status_label(qty, min_q)
+        if filter_inv != "Todos" and st_lbl != filter_inv:
+            continue
+        if term and term not in it["name"].lower() and term not in str(it.get("category") or "").lower():
+            continue
+        filtered_inv.append(it)
+
+    with st.expander("Ver inventário em tabela"):
+        st.dataframe(pd.DataFrame(inventory_rows(filtered_inv, format_brl)), hide_index=True, **STRETCH)
+
+    if not filtered_inv:
+        st.info("Nenhum item encontrado no inventário para o filtro atual.")
+    else:
+        for it in filtered_inv:
+            iid = int(it["id"])
+            qty = int(it.get("stock_qty", 0))
+            min_q = int(it.get("min_stock", 0))
+            unit = float(it.get("unit_price", 0.0))
+            st_lbl, chip_cls = inventory_status_label(qty, min_q)
+
+            with st.container(border=True):
+                c_vis, c_info, c_qty, c_actions = st.columns([0.65, 2.2, 1.3, 1.6], gap="medium")
+                with c_vis:
+                    render_item_visual(it, size=50)
+                with c_info:
+                    st.markdown(
+                        f"**{esc(it['name'])}** "
+                        f"<span class='chip'>{esc(it.get('category') or 'Geral')}</span> "
+                        f"<span class='chip {chip_cls}'>{st_lbl}</span>",
+                        unsafe_allow_html=True,
+                    )
+                    st.caption(
+                        f"Unitário: {format_brl(unit)} · Total em estoque: {format_brl(qty * unit)} · Mínimo: {min_q} un."
+                    )
+                with c_qty:
+                    st.markdown(
+                        f"<div style='font-size:1.35rem;font-weight:800;'>{qty} un.</div>",
+                        unsafe_allow_html=True,
+                    )
+                    q1, q2 = st.columns(2)
+                    q1.button(
+                        "-1",
+                        key=f"inv_dec_{iid}",
+                        disabled=qty <= 0,
+                        on_click=inv_quick_delta,
+                        args=(iid, -1, "Saida rapida (-1)"),
+                        **STRETCH,
+                    )
+                    q2.button(
+                        "+1",
+                        key=f"inv_inc_{iid}",
+                        on_click=inv_quick_delta,
+                        args=(iid, 1, "Entrada rapida (+1)"),
+                        **STRETCH,
+                    )
+                with c_actions:
+                    with st.popover("Alterar / Repor", **STRETCH):
+                        with st.form(f"inv_edit_form_{iid}"):
+                            ed_name = st.text_input("Nome", value=it["name"], key=f"inv_ed_name_{iid}")
+                            ed_price = st.number_input(
+                                "Valor unitário (R$)", min_value=0.0, value=unit, step=1.0, format="%.2f", key=f"inv_ed_price_{iid}"
+                            )
+                            ed_cat = st.text_input(
+                                "Categoria", value=it.get("category") or "Geral", key=f"inv_ed_cat_{iid}"
+                            )
+                            ed_qty = st.number_input(
+                                "Quantidade exata em estoque", min_value=0, value=qty, step=1, key=f"inv_ed_qty_{iid}"
+                            )
+                            ed_min = st.number_input(
+                                "Estoque mínimo para alerta", min_value=0, value=min_q, step=1, key=f"inv_ed_min_{iid}"
+                            )
+                            if st.form_submit_button("Salvar alterações", type="primary", **STRETCH):
+                                ok, msg = update_catalog_item(
+                                    item_id=iid,
+                                    name=ed_name,
+                                    unit_price=ed_price,
+                                    icon=it.get("icon") or "[ITEM]",
+                                    category=ed_cat,
+                                    image_path=it.get("image_path") or "",
+                                    stock_qty=int(ed_qty),
+                                    min_stock=int(ed_min),
+                                    in_inventory=1,
+                                )
+                                notify("success" if ok else "warning", msg)
+                                st.rerun()
+
+                    st.button(
+                        "Remover",
+                        key=f"inv_del_{iid}",
+                        on_click=inv_remove_direct,
+                        args=(iid,),
+                        **STRETCH,
+                    )
+
+    movements = get_inventory_movements(limit=30)
+    if movements:
+        with st.expander("Histórico recente de movimentações de estoque"):
+            mov_df = pd.DataFrame(
+                [
+                    {
+                        "Data": m["created_at"],
+                        "Item": m["item_name"],
+                        "Movimento": f"+{m['delta']}" if int(m["delta"]) > 0 else str(m["delta"]),
+                        "Saldo após": m["balance_after"],
+                        "Motivo": m["reason"],
+                    }
+                    for m in movements
+                ]
+            )
+            st.dataframe(mov_df, hide_index=True, **STRETCH)
+
+
+# ---- Catálogo: cadastro e edição -------------------------------------------
+
+
 def render_new_item_form() -> None:
     st.markdown("#### Cadastrar novo brinde")
     with st.form("add_catalog_form", clear_on_submit=True):
-        c1, c2, c3, c4 = st.columns([2.0, 1.2, 1.0, 1.5])
+        c1, c2, c3, c4, c5 = st.columns([1.8, 1.1, 0.9, 1.0, 1.3])
         name = c1.text_input("Nome do brinde *", placeholder="Ex.: Mochila")
         price = c2.number_input("Valor unitário (R$) *", min_value=0.0, value=20.0, step=1.0, format="%.2f")
-        icon = c3.text_input("Sigla (opcional)", placeholder="Ex.: MOC", max_chars=12)
-        category = c4.text_input("Categoria (opcional)", placeholder="Ex.: Acessórios")
+        stock = c3.number_input("Estoque inicial", min_value=0, value=20, step=1)
+        icon = c4.text_input("Sigla", placeholder="Ex.: MOC", max_chars=12)
+        category = c5.text_input("Categoria", placeholder="Ex.: Acessórios")
         image = st.file_uploader("Imagem do brinde (opcional)", type=ALLOWED_IMAGE_TYPES, key="new_item_uploader")
 
         if st.form_submit_button("Cadastrar brinde", type="primary"):
             image_path = save_uploaded_image(image) if image else ""
             ok, msg = add_catalog_item(
-                name=name, unit_price=price, icon=icon, category=category, image_path=image_path
+                name=name,
+                unit_price=price,
+                icon=icon,
+                category=category,
+                image_path=image_path,
+                stock_qty=int(stock),
+                in_inventory=1,
             )
             notify("success" if ok else "warning", msg)
             st.rerun()
@@ -1158,7 +1461,11 @@ def render_new_item_form() -> None:
 
 def render_edit_item(item: Item) -> None:
     item_id = int(item["id"])
-    label = f"{item['name']}  ·  {format_brl(item['unit_price'])}  ·  {item.get('category') or 'Geral'}"
+    stock_qty = int(item.get("stock_qty", 0))
+    label = (
+        f"{item['name']}  ·  {format_brl(item['unit_price'])}  ·  "
+        f"{item.get('category') or 'Geral'}  ·  Estoque: {stock_qty} un."
+    )
     with st.expander(label):
         c_img, c_form = st.columns([1.0, 3.2], gap="medium")
         with c_img:
@@ -1166,16 +1473,19 @@ def render_edit_item(item: Item) -> None:
 
         with c_form:
             with st.form(f"edit_catalog_form_{item_id}"):
-                f1, f2, f3, f4 = st.columns([2.0, 1.2, 1.0, 1.5])
+                f1, f2, f3, f4, f5 = st.columns([1.8, 1.1, 0.9, 1.0, 1.3])
                 name = f1.text_input("Nome", value=item["name"], key=f"ed_name_{item_id}")
                 price = f2.number_input(
                     "Valor unitário (R$)", min_value=0.0, value=float(item["unit_price"]),
                     step=1.0, format="%.2f", key=f"ed_price_{item_id}",
                 )
-                icon = f3.text_input(
+                stock = f3.number_input(
+                    "Estoque (un.)", min_value=0, value=stock_qty, step=1, key=f"ed_stock_{item_id}",
+                )
+                icon = f4.text_input(
                     "Sigla", value=icon_for_input(item), max_chars=12, key=f"ed_icon_{item_id}"
                 )
-                category = f4.text_input(
+                category = f5.text_input(
                     "Categoria", value=item.get("category") or "Geral", key=f"ed_cat_{item_id}"
                 )
                 upload = st.file_uploader(
@@ -1186,8 +1496,13 @@ def render_edit_item(item: Item) -> None:
                     if upload is not None:
                         image_path = save_uploaded_image(upload)
                     ok, msg = update_catalog_item(
-                        item_id=item_id, name=name, unit_price=price,
-                        icon=icon, category=category, image_path=image_path,
+                        item_id=item_id,
+                        name=name,
+                        unit_price=price,
+                        icon=icon,
+                        category=category,
+                        image_path=image_path,
+                        stock_qty=int(stock),
                     )
                     notify("success" if ok else "warning", msg)
                     st.rerun()
@@ -1368,6 +1683,7 @@ def main() -> None:
 
     catalog = get_catalog_items()
     catalog_by_id = {int(item["id"]): item for item in catalog}
+    inv_items = get_inventory_items()
     recipes = get_recipes()
     history = get_kits_history()
 
@@ -1377,13 +1693,17 @@ def main() -> None:
         if int(k) in catalog_by_id and int(v) > 0
     }
 
+    total_stock = sum(int(it.get("stock_qty", 0)) for it in inv_items)
+
     show_flash()
-    render_header(len(history))
-    page = render_nav(len(history))
+    render_header(len(history), total_stock)
+    page = render_nav(len(history), total_stock)
     render_last_summary()
 
     if page == "montagem":
         page_assembly(catalog, catalog_by_id, recipes)
+    elif page == "inventario":
+        page_inventory(inv_items, catalog)
     elif page == "catalogo":
         page_catalog(catalog)
     else:
