@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -11,10 +12,12 @@ from zoneinfo import ZoneInfo
 
 try:
     import psycopg2
+    from psycopg2 import pool as pg_pool
     from psycopg2.extras import RealDictCursor
 except ImportError:
-    psycopg2 = None  # type: ignore[assignment]
-    RealDictCursor = None  # type: ignore[assignment]
+    psycopg2 = None  # type: ignore
+    pg_pool = None  # type: ignore
+    RealDictCursor = None  # type: ignore
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -30,6 +33,62 @@ except Exception:  # tzdata ausente: usa o horário local da máquina
 def _now() -> str:
     """Data/hora no fuso de São Paulo (o servidor costuma rodar em UTC)."""
     return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+# --- Versão dos dados: sobe a cada escrita; o app usa para invalidar o cache ---
+_DATA_VERSION = 0
+
+
+def data_version() -> int:
+    return _DATA_VERSION
+
+
+def _bump_data_version() -> None:
+    global _DATA_VERSION
+    _DATA_VERSION += 1
+
+
+# --- Pool de conexões PostgreSQL: reaproveita conexões em vez de reconectar ---
+_PG_POOL: Any = None
+_PG_POOL_URL = ""
+_PG_POOL_LOCK = threading.Lock()
+
+
+def _get_pg_pool(db_url: str) -> Any:
+    global _PG_POOL, _PG_POOL_URL
+    with _PG_POOL_LOCK:
+        if _PG_POOL is None or _PG_POOL_URL != db_url:
+            _PG_POOL = pg_pool.ThreadedConnectionPool(
+                1,
+                8,
+                dsn=db_url,
+                connect_timeout=10,
+                keepalives=1,
+                keepalives_idle=30,
+                keepalives_interval=10,
+                keepalives_count=5,
+            )
+            _PG_POOL_URL = db_url
+        return _PG_POOL
+
+
+def _checkout_pg_connection(db_url: str) -> tuple[Any, Any]:
+    """Pega uma conexão do pool e confirma que ainda está viva."""
+    pool = _get_pg_pool(db_url)
+    last_exc: Exception | None = None
+    for _ in range(3):
+        conn = pool.getconn()
+        try:
+            if conn.closed:
+                raise psycopg2.InterfaceError("conexao fechada")
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+            conn.rollback()
+            return pool, conn
+        except Exception as exc:
+            last_exc = exc
+            pool.putconn(conn, close=True)
+    raise RuntimeError(f"Nao foi possivel conectar ao banco: {last_exc}")
 
 
 DEFAULT_ITEMS: list[dict[str, Any]] = [
@@ -91,9 +150,11 @@ def _get_database_url() -> str:
 class _DBWrapper:
     """Camada unificada para SQLite e PostgreSQL com placeholders '?' e retorno tipo dict."""
 
-    def __init__(self, conn: Any, is_postgres: bool) -> None:
+    def __init__(self, conn: Any, is_postgres: bool, release: Any = None) -> None:
         self._conn = conn
         self.is_postgres = is_postgres
+        self._release = release
+        self.dirty = False  # vira True quando há escrita (INSERT/UPDATE/DELETE/DDL)
 
     def _adapt(self, sql: str) -> str:
         if not self.is_postgres:
@@ -101,6 +162,8 @@ class _DBWrapper:
         return sql.replace("?", "%s")
 
     def execute(self, sql: str, params: tuple[Any, ...] | list[Any] = ()) -> Any:
+        if not sql.lstrip().upper().startswith(("SELECT", "PRAGMA", "WITH")):
+            self.dirty = True
         adapted = self._adapt(sql)
         if self.is_postgres:
             cur = self._conn.cursor(cursor_factory=RealDictCursor)
@@ -112,10 +175,16 @@ class _DBWrapper:
         self._conn.commit()
 
     def rollback(self) -> None:
-        self._conn.rollback()
+        try:
+            self._conn.rollback()
+        except Exception:
+            pass
 
     def close(self) -> None:
-        self._conn.close()
+        if self._release is not None:
+            self._release(self._conn)  # devolve ao pool
+        else:
+            self._conn.close()
 
 
 @contextmanager
@@ -126,8 +195,8 @@ def get_connection(db_path: Path = DB_PATH) -> Iterator[_DBWrapper]:
     if db_url:
         if psycopg2 is None:
             raise RuntimeError("Pacote 'psycopg2-binary' nao instalado. Adicione-o ao requirements.txt.")
-        raw_conn = psycopg2.connect(db_url)
-        wrapper = _DBWrapper(raw_conn, is_postgres=True)
+        pool, raw_conn = _checkout_pg_connection(db_url)
+        wrapper = _DBWrapper(raw_conn, is_postgres=True, release=pool.putconn)
     else:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         raw_conn = sqlite3.connect(str(db_path), check_same_thread=False)
@@ -138,6 +207,8 @@ def get_connection(db_path: Path = DB_PATH) -> Iterator[_DBWrapper]:
     try:
         yield wrapper
         wrapper.commit()
+        if wrapper.dirty:
+            _bump_data_version()
     except Exception:
         wrapper.rollback()
         raise

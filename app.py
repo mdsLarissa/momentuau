@@ -18,12 +18,12 @@ from database import (
     ASSETS_DIR,
     add_catalog_item,
     adjust_inventory_stock,
+    data_version,
     delete_catalog_item,
     delete_kit,
     delete_recipe,
     format_address_summary,
     get_catalog_items,
-    get_inventory_items,
     get_inventory_movements,
     get_kits_history,
     get_recipes,
@@ -249,6 +249,7 @@ def inventory_rows(items: list[Item], money: Callable[[float], Any]) -> list[dic
     return rows
 
 
+@st.cache_data(show_spinner=False)
 def build_inventory_excel_bytes(items: list[Item]) -> bytes:
     df = pd.DataFrame(inventory_rows(items, float))
     output = io.BytesIO()
@@ -267,6 +268,7 @@ def build_inventory_excel_bytes(items: list[Item]) -> bytes:
     return output.getvalue()
 
 
+@st.cache_data(show_spinner=False)
 def build_inventory_csv_bytes(items: list[Item]) -> bytes:
     df = pd.DataFrame(inventory_rows(items, format_brl))
     return df.to_csv(index=False, sep=";").encode("utf-8-sig")
@@ -288,7 +290,7 @@ def _empty_recipient(kit_code: str = "", status: str = "") -> dict[str, str]:
 
 
 # =============================================================================
-# 3. ESTADO E AÇÕES (CALLBACKS)
+# 3. DADOS EM CACHE, ESTADO E AÇÕES (CALLBACKS)
 # =============================================================================
 
 
@@ -297,6 +299,21 @@ def _init_db_once() -> bool:
     """Cria/verifica as tabelas só uma vez por deploy (evita consultas a cada clique)."""
     init_db()
     return True
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def _load_app_data(version: int) -> dict[str, Any]:
+    """Lê o banco uma vez por versão dos dados; o resto vem do cache."""
+    return {
+        "catalog": get_catalog_items(),
+        "recipes": get_recipes(),
+        "history": get_kits_history(),
+    }
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def _load_movements(version: int, limit: int = 30) -> list[Item]:
+    return get_inventory_movements(limit=limit)
 
 
 def init_session_state() -> None:
@@ -666,7 +683,7 @@ def inv_remove_direct(item_id: int) -> None:
 
 
 # =============================================================================
-# 4. ESTILOS (DASHBOARD MODERNO COM ACENTUAÇÕES EM AZUL)
+# 4. ESTILOS (ADAPTATIVOS CLARO/ESCURO, ACENTOS EM AZUL, LAYOUT COMPACTO)
 # =============================================================================
 
 CSS = """
@@ -678,145 +695,143 @@ CSS = """
         --uau-sky: #60a5fa;
         --uau-blue-soft: rgba(37, 99, 235, 0.12);
         --uau-blue-border: rgba(37, 99, 235, 0.34);
-        --uau-navy: #0f172a;
-        --uau-navy-2: #1e293b;
-        --uau-border: rgba(148, 163, 184, 0.26);
+        --uau-border: rgba(148, 163, 184, 0.30);
     }
 
-    .block-container { padding-top: 1.4rem; padding-bottom: 3rem; max-width: 1360px; }
+    .block-container { padding-top: 1.2rem; padding-bottom: 2.5rem; max-width: 1360px; }
 
-    /* Cards (containers com borda) e inputs mais arredondados */
-    div[data-testid="stVerticalBlockBorderWrapper"] { border-radius: 18px; }
+    /* Cards e inputs arredondados */
+    div[data-testid="stVerticalBlockBorderWrapper"] { border-radius: 16px; }
     div[data-baseweb="input"], div[data-baseweb="select"] > div, div[data-baseweb="textarea"] {
         border-radius: 10px !important;
     }
 
-    /* ---------- Cabeçalho escuro com detalhes em azul ---------- */
+    /* ---------- Cabeçalho (segue o tema claro/escuro) ---------- */
     .top-bar {
-        display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 14px;
-        background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
-        color: #ffffff;
-        border-radius: 22px; padding: 16px 24px; margin-bottom: 14px;
-        box-shadow: 0 8px 24px rgba(15, 23, 42, 0.20);
+        display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px;
+        background: var(--secondary-background-color);
+        border: 1px solid var(--uau-border);
+        color: var(--text-color);
+        border-radius: 18px; padding: 12px 20px; margin-bottom: 10px;
+        box-shadow: 0 2px 10px rgba(15, 23, 42, 0.05);
     }
-    .brand-wrap { display: flex; align-items: center; gap: 14px; }
+    .brand-wrap { display: flex; align-items: center; gap: 12px; }
     .brand-badge {
-        width: 44px; height: 44px; border-radius: 14px;
+        width: 40px; height: 40px; border-radius: 12px;
         background: linear-gradient(135deg, #2563eb 0%, #3b82f6 100%);
-        color: #ffffff; font-weight: 800; font-size: 0.92rem; letter-spacing: 0.04em;
+        color: #ffffff; font-weight: 800; font-size: 0.85rem; letter-spacing: 0.04em;
         display: flex; align-items: center; justify-content: center;
-        box-shadow: 0 6px 16px rgba(37, 99, 235, 0.45);
+        box-shadow: 0 4px 12px rgba(37, 99, 235, 0.35);
     }
-    .hero-title { font-size: 1.38rem; font-weight: 800; line-height: 1.2; letter-spacing: -0.01em; color: #ffffff; }
-    .hero-sub { margin-top: 2px; font-size: 0.84rem; color: rgba(255, 255, 255, 0.66); }
+    .hero-title { font-size: 1.25rem; font-weight: 800; line-height: 1.2; letter-spacing: -0.01em; color: var(--text-color); }
+    .hero-sub { margin-top: 1px; font-size: 0.8rem; opacity: 0.66; }
     .header-pills { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
     .hero-pill {
-        background: rgba(96, 165, 250, 0.14); border: 1px solid rgba(96, 165, 250, 0.36);
-        color: #93c5fd; border-radius: 999px;
-        padding: 6px 14px; font-size: 0.8rem; font-weight: 700; white-space: nowrap;
-    }
-    .hero-pill-solid {
-        background: var(--uau-blue); color: #ffffff; border-radius: 999px;
-        padding: 6px 14px; font-size: 0.8rem; font-weight: 700; white-space: nowrap;
+        background: var(--uau-blue-soft); border: 1px solid var(--uau-blue-border);
+        color: var(--uau-blue-light); border-radius: 999px;
+        padding: 5px 14px; font-size: 0.78rem; font-weight: 700; white-space: nowrap;
     }
 
-    /* ---------- Navegação em pílulas ---------- */
-    div[role="radiogroup"] {
-        display: inline-flex !important; flex-wrap: wrap; gap: 6px;
-        background: var(--uau-navy);
-        border-radius: 999px; padding: 6px; margin-bottom: 10px;
+    /* ---------- Navegação (segmented control) ---------- */
+    [data-testid="stBaseButton-segmented_controlActive"] {
+        background: linear-gradient(135deg, #2563eb 0%, #3b82f6 100%) !important;
+        border-color: #2563eb !important;
+        color: #ffffff !important;
     }
-    div[role="radiogroup"] > label {
-        background: transparent; border: 1px solid transparent;
-        border-radius: 999px; padding: 6px 18px; cursor: pointer; margin: 0;
-        transition: all 0.16s ease;
-    }
-    div[role="radiogroup"] > label > div:first-child { display: none; }
-    div[role="radiogroup"] > label * { color: rgba(255, 255, 255, 0.80) !important; }
-    div[role="radiogroup"] > label:hover { background: rgba(255, 255, 255, 0.08); }
-    div[role="radiogroup"] > label:has(input:checked) {
-        background: linear-gradient(135deg, #2563eb 0%, #3b82f6 100%);
-        box-shadow: 0 4px 12px rgba(37, 99, 235, 0.40);
-    }
-    div[role="radiogroup"] > label:has(input:checked) * { color: #ffffff !important; font-weight: 700; }
+    [data-testid="stBaseButton-segmented_controlActive"] * { color: #ffffff !important; font-weight: 700; }
+
+    /* ---------- Abas ---------- */
+    button[data-baseweb="tab"][aria-selected="true"],
+    button[data-baseweb="tab"][aria-selected="true"] * { color: var(--uau-blue-light) !important; }
+    div[data-baseweb="tab-highlight"] { background-color: var(--uau-blue) !important; }
 
     /* ---------- KPIs ---------- */
     .kpi-grid {
-        display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px;
-        margin-bottom: 16px;
+        display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px;
+        margin: 6px 0 14px;
     }
-    @media (max-width: 900px) { .kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+    @media (max-width: 700px) { .kpi-grid { grid-template-columns: 1fr; } }
     .kpi-card {
         background: var(--secondary-background-color);
         border: 1px solid var(--uau-border);
-        border-radius: 20px; padding: 14px 18px;
+        border-radius: 16px; padding: 10px 16px;
         transition: border-color 0.15s ease;
     }
     .kpi-card:hover { border-color: var(--uau-blue-border); }
-    .kpi-card-accent {
-        background: linear-gradient(135deg, #0f172a 0%, #1e3a8a 100%);
-        border: 1px solid #1e3a8a; color: #ffffff;
-    }
-    .kpi-card-accent .kpi-num { color: var(--uau-sky); }
-    .kpi-label { font-size: 0.75rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; opacity: 0.68; }
-    .kpi-num { font-size: 1.48rem; font-weight: 800; line-height: 1.2; margin-top: 4px; }
-    .kpi-sub { font-size: 0.78rem; opacity: 0.68; margin-top: 2px; }
+    .kpi-label { font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; opacity: 0.66; }
+    .kpi-num { font-size: 1.3rem; font-weight: 800; line-height: 1.2; margin-top: 2px; }
+    .kpi-sub { font-size: 0.76rem; opacity: 0.66; margin-top: 1px; }
 
     /* ---------- Resumo do kit ---------- */
     .summary-header {
         display: flex; justify-content: space-between; align-items: center;
-        padding-bottom: 10px; margin-bottom: 12px;
+        padding-bottom: 8px; margin-bottom: 6px;
         border-bottom: 1px solid var(--uau-border);
     }
-    .summary-title { font-size: 1.05rem; font-weight: 800; }
+    .summary-title { font-size: 1rem; font-weight: 800; }
 
-    /* ---------- Card de resumo de valor (estilo "Order Summary") ---------- */
+    /* ---------- Card de total (estilo "Order Summary", segue o tema) ---------- */
     .order-card {
-        background: linear-gradient(135deg, #0f172a 0%, #1e3a8a 100%);
-        color: #ffffff; border-radius: 20px; padding: 18px 22px; margin: 10px 0 12px;
-        box-shadow: 0 10px 26px rgba(30, 58, 138, 0.28);
+        background: var(--secondary-background-color);
+        border: 1px solid var(--uau-border);
+        border-top: 3px solid var(--uau-blue);
+        border-radius: 16px; padding: 12px 18px; margin: 8px 0 10px;
     }
-    .order-title { font-weight: 800; font-size: 1rem; margin-bottom: 10px; }
     .order-row {
         display: flex; justify-content: space-between; align-items: center;
-        font-size: 0.88rem; padding: 4px 0; color: rgba(255, 255, 255, 0.72);
+        font-size: 0.86rem; padding: 2px 0; opacity: 0.82;
     }
-    .order-row b { color: #ffffff; font-weight: 700; }
-    .order-divider { border-top: 1px solid rgba(255, 255, 255, 0.16); margin: 10px 0; }
+    .order-row b { font-weight: 700; }
+    .order-divider { border-top: 1px dashed var(--uau-border); margin: 8px 0; }
     .order-total { display: flex; justify-content: space-between; align-items: baseline; font-weight: 700; }
-    .order-total-value { font-size: 1.95rem; font-weight: 800; color: var(--uau-sky); }
-    .order-hint { margin-top: 6px; font-size: 0.76rem; color: rgba(255, 255, 255, 0.58); }
+    .order-total-value { font-size: 1.7rem; font-weight: 800; color: var(--uau-blue-light); }
+    .order-hint { margin-top: 2px; font-size: 0.74rem; opacity: 0.6; }
+
+    /* ---------- Linhas compactas (catálogo e itens do kit) ---------- */
+    .row-name { font-weight: 700; font-size: 0.92rem; line-height: 1.25; }
+    .row-meta { font-size: 0.76rem; opacity: 0.7; line-height: 1.35; }
+    .row-price { font-weight: 800; font-size: 0.92rem; color: var(--uau-blue-light); text-align: right; }
+    .row-qty { text-align: center; font-weight: 800; font-size: 0.92rem; }
+
+    .st-key-catalog_list button,
+    .st-key-kit_lines button {
+        min-height: 2rem !important;
+        padding: 0.1rem 0.4rem !important;
+        border-radius: 10px !important;
+    }
+    .st-key-catalog_list button p,
+    .st-key-kit_lines button p { font-size: 0.88rem; }
+    .st-key-catalog_list [data-testid="stHorizontalBlock"],
+    .st-key-kit_lines [data-testid="stHorizontalBlock"] {
+        border-bottom: 1px solid var(--uau-border);
+        padding: 5px 0;
+        gap: 0.4rem;
+    }
+    .st-key-catalog_list [data-testid="stVerticalBlock"],
+    .st-key-kit_lines [data-testid="stVerticalBlock"] { gap: 0.1rem; }
 
     /* ---------- Ícones, chips e badges ---------- */
     .icon-tile {
         width: var(--s, 54px); height: var(--s, 54px);
         display: flex; align-items: center; justify-content: center;
-        font-size: var(--fs, 19px); font-weight: 800; color: var(--uau-blue);
-        overflow: hidden; border-radius: 14px;
+        font-size: var(--fs, 19px); font-weight: 800; color: var(--uau-blue-light);
+        overflow: hidden; border-radius: 12px;
         background: var(--uau-blue-soft);
         border: 1px solid var(--uau-blue-border);
     }
     .chip {
-        display: inline-block; font-size: 0.72rem; font-weight: 700;
-        padding: 2px 10px; border-radius: 999px;
+        display: inline-block; font-size: 0.7rem; font-weight: 700;
+        padding: 1px 9px; border-radius: 999px;
         background: var(--uau-blue-soft); color: var(--uau-blue-light);
     }
-    .chip-blue   { background: rgba(37, 99, 235, 0.15); color: #2563eb; }
+    .chip-blue   { background: rgba(37, 99, 235, 0.15); color: var(--uau-blue-light); }
     .chip-warn   { background: rgba(245, 158, 11, 0.16); color: #d97706; }
     .chip-ok     { background: rgba(16, 185, 129, 0.16); color: #059669; }
     .chip-danger { background: rgba(239, 68, 68, 0.16); color: #dc2626; }
 
-    .qty-badge {
-        display: inline-block; background: var(--uau-blue); color: #ffffff;
-        font-size: 0.76rem; font-weight: 700; padding: 2px 10px; border-radius: 999px;
-    }
     .price { font-size: 1.02rem; font-weight: 800; color: var(--uau-blue-light); }
-    .kit-value { font-size: 1.45rem; font-weight: 800; text-align: right; line-height: 1.2; color: var(--uau-blue-light); }
+    .kit-value { font-size: 1.4rem; font-weight: 800; text-align: right; line-height: 1.2; color: var(--uau-blue-light); }
     .kit-meta { text-align: right; opacity: 0.65; font-size: 0.82rem; }
-    .box-title { font-weight: 800; font-size: 0.98rem; }
-    .tile-name { text-align: center; font-weight: 700; font-size: 0.88rem; margin-top: 4px; }
-    .tile-qty { text-align: center; margin: 4px 0 2px; }
-    .tile-sub { text-align: center; opacity: 0.72; font-size: 0.8rem; font-weight: 600; margin-bottom: 6px; }
 
     /* ---------- Botões primários em azul ---------- */
     button[kind="primary"],
@@ -861,8 +876,7 @@ def render_item_visual(item: Item, size: int = 56) -> None:
     )
 
 
-def render_header(history_count: int, total_stock: int) -> None:
-    in_block = history_count % MAX_BATCH_KITS
+def render_header(total_stock: int) -> None:
     render_html(
         f"""
         <div class="top-bar">
@@ -875,7 +889,6 @@ def render_header(history_count: int, total_stock: int) -> None:
             </div>
             <div class="header-pills">
                 <span class="hero-pill">Estoque total: {total_stock} un.</span>
-                <span class="hero-pill-solid">Bloco: {in_block}/{MAX_BATCH_KITS} kits</span>
             </div>
         </div>
         """
@@ -883,36 +896,47 @@ def render_header(history_count: int, total_stock: int) -> None:
 
 
 def render_nav(history_count: int, total_stock: int) -> str:
+    ss = st.session_state
+    restore = ss.pop("_restore_nav", None)
+    if restore:
+        ss.nav_page = restore
+
     labels = dict(PAGES)
     labels["inventario"] = f"{PAGES['inventario']} ({total_stock})"
     labels["historico"] = f"{PAGES['historico']} ({history_count})"
-    return st.radio(
-        "Navegação",
-        options=list(labels),
-        format_func=labels.get,
-        key="nav_page",
-        horizontal=True,
-        label_visibility="collapsed",
-    )
+
+    if hasattr(st, "segmented_control"):
+        choice = st.segmented_control(
+            "Navegação",
+            options=list(labels),
+            format_func=labels.get,
+            key="nav_page",
+            label_visibility="collapsed",
+        )
+    else:
+        choice = st.radio(
+            "Navegação",
+            options=list(labels),
+            format_func=labels.get,
+            key="nav_page",
+            horizontal=True,
+            label_visibility="collapsed",
+        )
+
+    if choice is None:  # clicar na aba ativa a desmarcaria: volta para a última página
+        ss["_restore_nav"] = ss.get("_last_page", "montagem")
+        st.rerun()
+    ss["_last_page"] = choice
+    return choice
 
 
-def render_top_kpis(
-    totals: KitTotals,
-    total_stock: int,
-    low_stock_count: int,
-    history: list[Item],
-) -> None:
+def render_top_kpis(total_stock: int, low_stock_count: int, history: list[Item]) -> None:
     accumulated_val = sum(float(k.get("total_value", 0.0)) for k in history)
     alert_text = f"{low_stock_count} item(ns) em alerta" if low_stock_count else "Níveis normais"
     average = format_brl(accumulated_val / len(history)) if history else "R$ 0,00"
     render_html(
         f"""
         <div class="kpi-grid">
-            <div class="kpi-card kpi-card-accent">
-                <div class="kpi-label">Kit em montagem</div>
-                <div class="kpi-num">{format_brl(totals.value)}</div>
-                <div class="kpi-sub">{totals.quantity} item(ns) na caixa</div>
-            </div>
             <div class="kpi-card">
                 <div class="kpi-label">Kits finalizados</div>
                 <div class="kpi-num">{len(history)}</div>
@@ -998,24 +1022,25 @@ def render_recipes(recipes: list[Item], catalog: list[Item], catalog_by_id: dict
         with tab_use:
             if not recipes:
                 st.caption("Nenhuma receita cadastrada.")
-            for row in chunked(recipes, 3):
-                cols = st.columns(3, gap="small")
-                for col, rec in zip(cols, row):
-                    with col, st.container(border=True):
-                        st.markdown(f"**{esc(rec['name'])}**")
-                        parts = [
-                            f"{qty}× {catalog_by_id[iid]['name']}"
-                            for iid, qty in rec["items"].items()
-                            if iid in catalog_by_id
-                        ]
-                        st.caption(", ".join(parts) if parts else "Sem itens")
-                        st.button(
-                            "Aplicar",
-                            key=f"apply_recipe_{rec['id']}",
-                            on_click=apply_recipe,
-                            args=(rec["name"], rec["items"]),
-                            **STRETCH,
-                        )
+            for rec in recipes:
+                c_info, c_btn = st.columns([3.2, 1.0], vertical_alignment="center")
+                parts = [
+                    f"{qty}× {catalog_by_id[iid]['name']}"
+                    for iid, qty in rec["items"].items()
+                    if iid in catalog_by_id
+                ]
+                c_info.markdown(
+                    f"<div class='row-name'>{esc(rec['name'])}</div>"
+                    f"<div class='row-meta'>{esc(', '.join(parts) if parts else 'Sem itens')}</div>",
+                    unsafe_allow_html=True,
+                )
+                c_btn.button(
+                    "Aplicar",
+                    key=f"apply_recipe_{rec['id']}",
+                    on_click=apply_recipe,
+                    args=(rec["name"], rec["items"]),
+                    **STRETCH,
+                )
 
         with tab_save:
             with st.form("save_recipe_form", clear_on_submit=True):
@@ -1068,9 +1093,17 @@ def render_catalog_cards(catalog: list[Item]) -> None:
         st.markdown("#### Catálogo de brindes")
 
         categories = ["Todas"] + sorted({str(it.get("category") or "Geral") for it in catalog})
-        f1, f2 = st.columns([1.4, 1.0])
-        search = f1.text_input("Buscar", placeholder="Ex.: garrafa, blusa…", key="catalog_search")
-        category = f2.selectbox("Categoria", categories, key="catalog_category_filter")
+        f1, f2 = st.columns([1.6, 1.0])
+        search = f1.text_input(
+            "Buscar", placeholder="Buscar brinde…", key="catalog_search", label_visibility="collapsed"
+        )
+        category = f2.selectbox(
+            "Categoria",
+            categories,
+            key="catalog_category_filter",
+            label_visibility="collapsed",
+            format_func=lambda c: "Todas as categorias" if c == "Todas" else c,
+        )
 
         term = search.strip().lower()
         filtered = [
@@ -1083,38 +1116,52 @@ def render_catalog_cards(catalog: list[Item]) -> None:
             st.info("Nenhum brinde encontrado para o filtro atual.")
             return
 
-        for row in chunked(filtered, 2):
-            cols = st.columns(2, gap="medium")
-            for col, item in zip(cols, row):
+        list_height = min(440, 56 * len(filtered) + 12)
+        with st.container(height=list_height, border=False, key="catalog_list"):
+            for item in filtered:
                 item_id = int(item["id"])
                 in_kit = int(st.session_state.kit_items.get(item_id, 0))
                 stock_qty = int(item.get("stock_qty", 0))
                 min_stock = int(item.get("min_stock", 0))
-                _, stock_chip = inventory_status_label(stock_qty, min_stock)
 
-                with col, st.container(border=True):
-                    c_vis, c_info = st.columns([0.9, 2.1])
-                    with c_vis:
-                        render_item_visual(item, size=58)
-                    with c_info:
-                        st.markdown(
-                            f"<span class='chip chip-blue'>{esc(item.get('category') or 'Geral')}</span> "
-                            f"<span class='chip {stock_chip}'>Estoque: {stock_qty}</span>",
-                            unsafe_allow_html=True,
-                        )
-                        st.markdown(f"**{esc(item['name'])}**")
-                        st.markdown(
-                            f"<span class='price'>{format_brl(item['unit_price'])}</span>",
-                            unsafe_allow_html=True,
-                        )
-                    st.button(
-                        f"Selecionado ({in_kit} no kit)" if in_kit else "Adicionar ao kit",
-                        key=f"add_catalog_item_{item_id}",
-                        type="primary" if in_kit else "secondary",
-                        on_click=add_item,
-                        args=(item_id,),
+                c_vis, c_info, c_price, c_dec, c_qty, c_inc = st.columns(
+                    [0.55, 2.3, 1.0, 0.5, 0.4, 0.5], vertical_alignment="center"
+                )
+                with c_vis:
+                    render_item_visual(item, size=36)
+
+                alert = ""
+                if stock_qty <= 0:
+                    alert = " <span class='chip chip-danger'>Sem estoque</span>"
+                elif stock_qty <= min_stock:
+                    alert = " <span class='chip chip-warn'>Baixo</span>"
+                c_info.markdown(
+                    f"<div class='row-name'>{esc(item['name'])}</div>"
+                    f"<div class='row-meta'>{esc(item.get('category') or 'Geral')} · {stock_qty} un.{alert}</div>",
+                    unsafe_allow_html=True,
+                )
+                c_price.markdown(
+                    f"<div class='row-price'>{format_brl(item['unit_price'])}</div>",
+                    unsafe_allow_html=True,
+                )
+                if in_kit:
+                    c_dec.button(
+                        "−",
+                        key=f"cat_dec_{item_id}",
+                        on_click=change_qty,
+                        args=(item_id, -1),
                         **STRETCH,
                     )
+                    c_qty.markdown(f"<div class='row-qty'>{in_kit}</div>", unsafe_allow_html=True)
+                c_inc.button(
+                    "+",
+                    key=f"add_catalog_item_{item_id}",
+                    type="primary" if in_kit else "secondary",
+                    disabled=stock_qty <= 0 or in_kit >= stock_qty,
+                    on_click=add_item,
+                    args=(item_id,),
+                    **STRETCH,
+                )
 
 
 def render_edit_banner() -> None:
@@ -1134,21 +1181,30 @@ def render_total_card(totals: KitTotals, recipients_count: int = 1) -> None:
     plural = "item" if totals.quantity == 1 else "itens"
     people = max(1, int(recipients_count))
     lote_total = round(totals.value * people, 2)
-    hint = (
-        "Valor por pessoa para preencher no formulário"
-        if people > 1
-        else "Valor para preencher no formulário"
-    )
+
+    if people > 1:
+        rows = (
+            f'<div class="order-row"><span>Valor por kit ({totals.quantity} {plural})</span>'
+            f"<b>{format_brl(totals.value)}</b></div>"
+            f'<div class="order-row"><span>Destinatários</span><b>{people}</b></div>'
+        )
+        label = "Total do lote"
+        hint = "Valor por pessoa para preencher no formulário"
+    else:
+        rows = (
+            f'<div class="order-row"><span>Itens no kit</span>'
+            f"<b>{totals.quantity} {plural}</b></div>"
+        )
+        label = "Valor do kit"
+        hint = "Valor para preencher no formulário"
+
     render_html(
         f"""
         <div class="order-card">
-            <div class="order-title">Resumo do valor</div>
-            <div class="order-row"><span>Itens por kit</span><b>{totals.quantity} {plural}</b></div>
-            <div class="order-row"><span>Valor por kit</span><b>{format_brl(totals.value)}</b></div>
-            <div class="order-row"><span>Destinatários</span><b>{people}</b></div>
+            {rows}
             <div class="order-divider"></div>
             <div class="order-total">
-                <span>Total</span>
+                <span>{label}</span>
                 <span class="order-total-value">{format_brl(lote_total)}</span>
             </div>
             <div class="order-hint">{hint}</div>
@@ -1167,7 +1223,7 @@ def render_gift_box(totals: KitTotals, multiplier: int = 1) -> None:
             unsafe_allow_html=True,
         )
         if not totals.lines:
-            st.caption("Nenhum item selecionado. Clique em um brinde ao lado ou aplique uma receita.")
+            st.caption("Nenhum item selecionado. Use o + no catálogo ou aplique uma receita.")
             return
 
         low_warnings = []
@@ -1179,28 +1235,24 @@ def render_gift_box(totals: KitTotals, multiplier: int = 1) -> None:
         if low_warnings:
             st.warning("Estoque insuficiente para finalizar: " + ", ".join(low_warnings))
 
-        for row in chunked(totals.lines, 3):
-            cols = st.columns(3, gap="small")
-            for col, line in zip(cols, row):
+        with st.container(key="kit_lines"):
+            for line in totals.lines:
                 item_id = line["item_id"]
-                with col, st.container(border=True):
-                    render_item_visual(line["item"], size=46)
-                    st.markdown(
-                        f"<div class='tile-name'>{esc(line['item']['name'])}</div>"
-                        f"<div class='tile-qty'><span class='qty-badge'>× {line['quantity']}</span></div>"
-                        f"<div class='tile-sub'>{format_brl(line['subtotal'])}</div>",
-                        unsafe_allow_html=True,
-                    )
-                    b1, b2 = st.columns(2)
-                    b1.button("−", key=f"box_dec_{item_id}", on_click=change_qty, args=(item_id, -1), **STRETCH)
-                    b2.button("+", key=f"box_inc_{item_id}", on_click=change_qty, args=(item_id, 1), **STRETCH)
-                    st.button(
-                        "Retirar",
-                        key=f"box_remove_{item_id}",
-                        on_click=remove_item,
-                        args=(item_id,),
-                        **STRETCH,
-                    )
+                c_vis, c_info, c_dec, c_qty, c_inc, c_rm = st.columns(
+                    [0.55, 2.6, 0.5, 0.4, 0.5, 0.5], vertical_alignment="center"
+                )
+                with c_vis:
+                    render_item_visual(line["item"], size=36)
+                c_info.markdown(
+                    f"<div class='row-name'>{esc(line['item']['name'])}</div>"
+                    f"<div class='row-meta'>{format_brl(line['unit_price'])} × {line['quantity']} = "
+                    f"<b>{format_brl(line['subtotal'])}</b></div>",
+                    unsafe_allow_html=True,
+                )
+                c_dec.button("−", key=f"box_dec_{item_id}", on_click=change_qty, args=(item_id, -1), **STRETCH)
+                c_qty.markdown(f"<div class='row-qty'>{line['quantity']}</div>", unsafe_allow_html=True)
+                c_inc.button("+", key=f"box_inc_{item_id}", on_click=change_qty, args=(item_id, 1), **STRETCH)
+                c_rm.button("✕", key=f"box_remove_{item_id}", on_click=remove_item, args=(item_id,), **STRETCH)
 
 
 def render_kit_form() -> None:
@@ -1214,20 +1266,18 @@ def render_kit_form() -> None:
 
     with st.container(border=True):
         st.markdown("**Dados do destinatário**")
-        c1, c2 = st.columns(2)
+        c1, c2, c3 = st.columns([1.0, 1.8, 1.2])
         with c1:
-            ss.form_kit_code = text("kit_code", "Número ou nome do kit", "Ex.: Kit 1")
+            ss.form_kit_code = text("kit_code", "Kit", "Ex.: Kit 1")
         with c2:
             ss.form_client_name = text("client_name", "Nome do cliente *", "Ex.: Cliente Novo")
-
-        c3, c4 = st.columns([1.0, 1.4])
         with c3:
             status_idx = STATUS_OPTIONS.index(ss.form_status) if ss.form_status in STATUS_OPTIONS else 0
             ss.form_status = st.selectbox(
                 "Status", STATUS_OPTIONS, index=status_idx, key=f"w_status_{nonce}"
             )
-        with c4:
-            ss.form_notes = text("notes", "Observações (opcional)", "Ex.: Entregar na recepção")
+
+        ss.form_notes = text("notes", "Observações (opcional)", "Ex.: Entregar na recepção")
 
         has_address = any(ss[f"form_{name}"] for name in ADDRESS_FIELDS)
         with st.expander("Endereço de entrega (opcional)", expanded=has_address):
@@ -1587,7 +1637,7 @@ def page_inventory(inv_items: list[Item], all_catalog: list[Item]) -> None:
                         **STRETCH,
                     )
 
-    movements = get_inventory_movements(limit=30)
+    movements = _load_movements(data_version())
     if movements:
         with st.expander("Histórico recente de movimentações de estoque"):
             mov_df = pd.DataFrame(
@@ -1707,6 +1757,7 @@ def history_rows(history: list[Item], money: Callable[[float], Any]) -> list[dic
     ]
 
 
+@st.cache_data(show_spinner=False)
 def build_excel_bytes(history: list[Item]) -> bytes:
     df = pd.DataFrame(history_rows(history, float))
     output = io.BytesIO()
@@ -1723,6 +1774,7 @@ def build_excel_bytes(history: list[Item]) -> bytes:
     return output.getvalue()
 
 
+@st.cache_data(show_spinner=False)
 def build_csv_bytes(history: list[Item]) -> bytes:
     df = pd.DataFrame(history_rows(history, format_brl))
     return df.to_csv(index=False, sep=";").encode("utf-8-sig")
@@ -1825,7 +1877,7 @@ def render_history(history: list[Item]) -> None:
 
 
 def page_assembly(catalog: list[Item], catalog_by_id: dict[int, Item], recipes: list[Item]) -> None:
-    col_left, col_right = st.columns([1.22, 1.0], gap="large")
+    col_left, col_right = st.columns([1.15, 1.0], gap="large")
     with col_left:
         render_recipes(recipes, catalog, catalog_by_id)
         st.write("")
@@ -1855,11 +1907,15 @@ def main() -> None:
     _init_db_once()
     init_session_state()
 
-    catalog = get_catalog_items()
+    data = _load_app_data(data_version())
+    catalog = data["catalog"]
     catalog_by_id = {int(item["id"]): item for item in catalog}
-    inv_items = get_inventory_items()
-    recipes = get_recipes()
-    history = get_kits_history()
+    inv_items = sorted(
+        (it for it in catalog if int(it.get("in_inventory", 1)) == 1),
+        key=lambda it: str(it["name"]).lower(),
+    )
+    recipes = data["recipes"]
+    history = data["history"]
 
     st.session_state.kit_items = {
         int(k): int(v)
@@ -1871,12 +1927,11 @@ def main() -> None:
     low_stock_count = sum(
         1 for it in inv_items if int(it.get("stock_qty", 0)) <= int(it.get("min_stock", 0))
     )
-    current_totals = compute_totals(st.session_state.kit_items, catalog_by_id)
 
     show_flash()
-    render_header(len(history), total_stock)
+    render_header(total_stock)
     page = render_nav(len(history), total_stock)
-    render_top_kpis(current_totals, total_stock, low_stock_count, history)
+    render_top_kpis(total_stock, low_stock_count, history)
     render_last_summary()
 
     if page == "montagem":
